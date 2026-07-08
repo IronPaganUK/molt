@@ -1,0 +1,92 @@
+name: Release
+
+# Tag a commit `v*` (e.g. v0.4.0) to build and publish a GitHub release:
+# one file per OS — molt-<version>-windows-x86_64.exe (the GUI) and
+# molt-<version>-linux-x86_64.tar.gz (the CLI). SHA-256 hashes are printed
+# in the release notes. Can also be run manually from the Actions tab to
+# test the packaging (no release is created for manual runs).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build GUI
+        run: cargo build --release --locked --features gui
+      - name: Package
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = "tag" ] || VERSION="dev"
+          mkdir dist
+          cp target/release/molt-gui.exe "dist/molt-$VERSION-windows-x86_64.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*.exe
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build CLI
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = "tag" ] || VERSION="dev"
+          mkdir dist
+          cp target/release/molt dist/
+          tar czf "dist/molt-$VERSION-linux-x86_64.tar.gz" -C dist molt
+          rm dist/molt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*.tar.gz
+
+  release:
+    needs: [windows, linux]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - name: Checksums
+        id: sums
+        run: |
+          cd dist
+          echo "Release checksums (also in the release notes below):"
+          sha256sum *
+          {
+            echo 'SUMS<<EOF'
+            sha256sum *
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.exe
+            dist/*.tar.gz
+          generate_release_notes: true
+          body: |
+            **SHA-256**
+            ```
+            ${{ steps.sums.outputs.SUMS }}
+            ```

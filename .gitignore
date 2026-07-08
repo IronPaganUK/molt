@@ -1,0 +1,14 @@
+# Build output
+/target/
+/target*/
+dist/
+
+# Test/scratch archives that shouldn't ship
+*.tmp
+
+# Editor/OS noise
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
