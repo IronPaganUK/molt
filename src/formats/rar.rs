@@ -28,6 +28,8 @@ pub struct RarBackend {
     /// Parallel to `entries` when header parsing succeeded; empty otherwise
     /// (extraction still works, punching is disabled).
     ranges: Vec<RarRange>,
+    /// Why `ranges` ended up empty, for diagnostics — set only when it did.
+    parse_diag: Option<String>,
     /// Parallel to `entries`: entry content is encrypted.
     encrypted_flags: Vec<bool>,
     password: Option<String>,
@@ -81,8 +83,22 @@ impl RarBackend {
 
         // Byte ranges via our own header walk. If it disagrees with the
         // listing, extraction still works but nothing is punched.
-        let ranges = parse_ranges(path).unwrap_or_default();
-        let ranges = if ranges.len() == entries.len() { ranges } else { Vec::new() };
+        let mut parse_diag = None;
+        let ranges = match parse_ranges(path) {
+            Ok(r) if r.len() == entries.len() => r,
+            Ok(r) => {
+                parse_diag = Some(format!(
+                    "header walk found {} entries, unrar listed {}",
+                    r.len(),
+                    entries.len()
+                ));
+                Vec::new()
+            }
+            Err(e) => {
+                parse_diag = Some(e.to_string());
+                Vec::new()
+            }
+        };
 
         let solid = ranges.iter().any(|r| r.solid);
         let packed_total: u64 = ranges.iter().map(|r| r.data_len).sum();
@@ -91,6 +107,7 @@ impl RarBackend {
             path: path.to_path_buf(),
             entries,
             ranges,
+            parse_diag,
             encrypted_flags,
             password: password.map(str::to_owned),
             any_encrypted,
@@ -138,9 +155,12 @@ impl Backend for RarBackend {
             ));
         }
         if opts.molt && self.ranges.is_empty() {
-            on(Event::Note(
-                "could not map this rar's entry offsets; extracting without freeing".into(),
-            ));
+            on(Event::Note(match &self.parse_diag {
+                Some(reason) => format!(
+                    "could not map this rar's entry offsets ({reason}); extracting without freeing"
+                ),
+                None => "could not map this rar's entry offsets; extracting without freeing".into(),
+            }));
         }
 
         let punch_handle = if punching {
@@ -428,13 +448,12 @@ fn parse_rar4<R: Read>(f: &mut R, start: u64) -> io::Result<Vec<RarRange>> {
             return Err(invalid("rar4: truncated header"));
         }
 
-        // ADD_SIZE (u32 right after the fixed part) when LONG_BLOCK is set;
-        // for file headers this field is PACK_SIZE.
-        let mut add_size = if flags & 0x8000 != 0 && rest.len() >= 4 {
-            u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as u64
-        } else {
-            0
-        };
+        // How much trailing data (beyond the header itself) follows before
+        // the next header, if any. RAR4 has no generic size field in the
+        // common 7-byte header — each block type that carries data puts
+        // its own size field at a fixed spot in its own layout, so this
+        // has to be worked out per header type below.
+        let mut add_size = 0u64;
 
         match htype {
             0x73 => {
@@ -443,19 +462,41 @@ fn parse_rar4<R: Read>(f: &mut R, start: u64) -> io::Result<Vec<RarRange>> {
                     return Err(invalid("rar4: encrypted headers"));
                 }
             }
-            0x74 => {
-                // file header; HIGH_PACK_SIZE extends PACK_SIZE past 4 GiB
-                if flags & 0x0100 != 0 && rest.len() >= 4 + 21 + 4 {
-                    let hp = &rest[25..29];
-                    add_size |= (u32::from_le_bytes([hp[0], hp[1], hp[2], hp[3]]) as u64) << 32;
+            0x74 | 0x7A => {
+                // File (0x74) and service/sub-block (0x7A) headers share
+                // the FileHeader layout: PackSize is its first field,
+                // unconditionally — no flag gates its presence.
+                if rest.len() < 4 {
+                    return Err(invalid("rar4: truncated file header"));
                 }
-                out.push(RarRange {
-                    data_start: pos + head_size,
-                    data_len: add_size,
-                    solid: flags & 0x0010 != 0,
-                });
+                let mut pack = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as u64;
+                // HIGH_PACK_SIZE (LHD_LARGE) extends PackSize past 4 GiB;
+                // it sits right after the fixed 25-byte field block.
+                if flags & 0x0100 != 0 && rest.len() >= 29 {
+                    let hp = &rest[25..29];
+                    pack |= (u32::from_le_bytes([hp[0], hp[1], hp[2], hp[3]]) as u64) << 32;
+                }
+                add_size = pack;
+                if htype == 0x74 {
+                    out.push(RarRange {
+                        data_start: pos + head_size,
+                        data_len: pack,
+                        solid: flags & 0x0010 != 0,
+                    });
+                }
+            }
+            0x77 | 0x78 => {
+                // Old-style service block (0x77) and recovery record /
+                // PROTECT (0x78) both lead with a 4-byte DataSize.
+                if rest.len() < 4 {
+                    return Err(invalid("rar4: truncated protect/service header"));
+                }
+                add_size = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as u64;
             }
             0x7B => break, // end of archive
+            // Comment (0x75), AV signature (0x76), sign (0x79): legacy
+            // block types with no trailing data block of their own —
+            // anything they carry lives inside head_size itself.
             _ => {}
         }
 
@@ -463,4 +504,106 @@ fn parse_rar4<R: Read>(f: &mut R, start: u64) -> io::Result<Vec<RarRange>> {
         pos += head_size + add_size;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Build a RAR4 common 7-byte block header.
+    fn common(htype: u8, flags: u16, head_size: u16, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&[0, 0]); // HeadCRC (unchecked by our parser)
+        buf.push(htype);
+        buf.extend_from_slice(&flags.to_le_bytes());
+        buf.extend_from_slice(&head_size.to_le_bytes());
+    }
+
+    /// A minimal RAR4 FILE header: fixed 25-byte field block (PackSize,
+    /// UnpSize, HostOS, CRC32, FileTime, UnpVer, Method, NameSize,
+    /// FileAttr) plus a 1-byte name, followed by `pack_size` bytes of
+    /// dummy compressed data.
+    fn file_header(name: u8, pack_size: u32, buf: &mut Vec<u8>) {
+        let rest_len = 25 + 1; // fixed fields + 1-byte name
+        common(0x74, 0x0000, 7 + rest_len as u16, buf);
+        buf.extend_from_slice(&pack_size.to_le_bytes()); // PackSize
+        buf.extend_from_slice(&pack_size.to_le_bytes()); // UnpSize (low)
+        buf.push(0); // HostOS
+        buf.extend_from_slice(&[0; 4]); // CRC32
+        buf.extend_from_slice(&[0; 4]); // FileTime
+        buf.push(20); // UnpVer
+        buf.push(0x30); // Method
+        buf.extend_from_slice(&1u16.to_le_bytes()); // NameSize
+        buf.extend_from_slice(&[0; 4]); // FileAttr
+        buf.push(name);
+        buf.extend(std::iter::repeat(0xEE).take(pack_size as usize));
+    }
+
+    /// A recovery-record (PROTECT) header: DataSize, Version, RecSectors,
+    /// TotalBlocks, an 8-byte mark, then `data_size` bytes of recovery
+    /// data — the exact block type that used to desync the RAR4 walk.
+    fn protect_header(data_size: u32, buf: &mut Vec<u8>) {
+        let rest_len = 4 + 1 + 2 + 4 + 8;
+        common(0x78, 0x0000, 7 + rest_len as u16, buf);
+        buf.extend_from_slice(&data_size.to_le_bytes());
+        buf.push(0); // Version
+        buf.extend_from_slice(&[0; 2]); // RecSectors
+        buf.extend_from_slice(&[0; 4]); // TotalBlocks
+        buf.extend_from_slice(&[0; 8]); // Mark
+        buf.extend(std::iter::repeat(0xBB).take(data_size as usize));
+    }
+
+    fn main_header(buf: &mut Vec<u8>) {
+        common(0x73, 0x0000, 7 + 6, buf);
+        buf.extend_from_slice(&[0; 6]); // HighPosAV + PosAV
+    }
+
+    fn end_header(buf: &mut Vec<u8>) {
+        common(0x7B, 0x0000, 7, buf);
+    }
+
+    #[test]
+    fn rar4_skips_recovery_record_between_files() {
+        let mut body = Vec::new();
+        main_header(&mut body);
+        file_header(b'a', 5, &mut body);
+        protect_header(50, &mut body); // must not desync the walk
+        file_header(b'b', 3, &mut body);
+        end_header(&mut body);
+
+        let mut archive = b"Rar!\x1a\x07\x00".to_vec();
+        archive.extend_from_slice(&body);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.rar");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&archive).unwrap();
+        drop(f);
+
+        let ranges = parse_ranges(&path).expect("parse_ranges must not error");
+        assert_eq!(ranges.len(), 2, "PROTECT header must not appear as a fake entry");
+        assert_eq!(ranges[0].data_len, 5, "a.txt PackSize");
+        assert_eq!(ranges[1].data_len, 3, "b.txt PackSize");
+    }
+
+    #[test]
+    fn rar4_single_file_no_recovery_record() {
+        let mut body = Vec::new();
+        main_header(&mut body);
+        file_header(b'x', 42, &mut body);
+        end_header(&mut body);
+
+        let mut archive = b"Rar!\x1a\x07\x00".to_vec();
+        archive.extend_from_slice(&body);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.rar");
+        std::fs::write(&path, &archive).unwrap();
+
+        let ranges = parse_ranges(&path).expect("parse_ranges must not error");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].data_len, 42);
+        // signature(7) + main header(7+6=13) + file header(7+26=33)
+        assert_eq!(ranges[0].data_start, 7 + 13 + 33);
+    }
 }

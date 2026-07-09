@@ -46,15 +46,22 @@ Verify a download: `Get-FileHash <file>` (Windows) or `sha256sum <file>` (Linux)
      Then move the table you're replacing down into the <details> block,
      newest-first. -->
 
+**v7.3.2**
+
+| File | SHA-256 | VirusTotal |
+|---|---|---|
+| `molt-7.3.2-windows-x86_64.exe` | `PENDING` | [report](https://www.virustotal.com/gui/file/PENDING) |
+| `molt-7.3.2-linux-x86_64.tar.gz` | `PENDING` | [report](https://www.virustotal.com/gui/file/PENDING) |
+
+<details>
+<summary><b>Older versions</b> (all clean — click to expand)</summary>
+
 **v7.3.1**
 
 | File | SHA-256 | VirusTotal |
 |---|---|---|
 | `molt-7.3.1-windows-x86_64.exe` | `018f8501c842aa1a79a313de1aba244ca66deee045a3b5c5db2a27f2ee215408` | [report](https://www.virustotal.com/gui/file/018f8501c842aa1a79a313de1aba244ca66deee045a3b5c5db2a27f2ee215408) |
 | `molt-7.3.1-linux-x86_64.tar.gz` | `3676014d205bab6a592d4026ed9018dab1db379c7125ad4617be28fb3b388182` | [report](https://www.virustotal.com/gui/file/3676014d205bab6a592d4026ed9018dab1db379c7125ad4617be28fb3b388182) |
-
-<details>
-<summary><b>Older versions</b> (all clean — click to expand)</summary>
 
 **v7.2.1**
 
