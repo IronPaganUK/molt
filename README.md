@@ -41,6 +41,8 @@ Releases are built automatically by GitHub Actions when a `v*` tag is pushed; th
 
 Verify a download: `Get-FileHash <file>` (Windows) or `sha256sum <file>` (Linux) and compare against the hash in the release notes. A file's VirusTotal report lives at `virustotal.com/gui/file/<sha-256>`.
 
+> **Antivirus false positives.** Microsoft Defender's machine-learning heuristic (`Trojan:Win32/Wacatac.B!ml` and similar `!ml` verdicts) sometimes flags the Windows build. This is a false positive, and it's an *expected* one: molt's core job — zeroing a file's bytes on disk and then deleting it — looks behaviorally like a wiper to a naive classifier, and the binary is unsigned, which compounds it. The signal that it's benign: only the ML engine flags it, never the signature-based scanners, and every release is built in the open by GitHub Actions from the public source (the tag's Actions log shows the exact build, and the published SHA-256 lets you confirm your download is that byte-for-byte). If you want zero doubt, build it yourself with `cargo build --release --features gui` and check the hash. Reports are submitted to Microsoft for whitelisting as they appear; proper code-signing (the durable fix) is planned.
+
 <!-- Per release: copy each file's hash from the release notes into the
      SHA-256 column below, and put the same hash into the VirusTotal link.
      Then move the table you're replacing down into the <details> block,
