@@ -42,9 +42,19 @@ Releases are built automatically by GitHub Actions when a `v*` tag is pushed; th
 Verify a download: `Get-FileHash <file>` (Windows) or `sha256sum <file>` (Linux) and compare against the hash in the release notes. A file's VirusTotal report lives at `virustotal.com/gui/file/<sha-256>`.
 
 <!-- Per release: copy each file's hash from the release notes into the
-     SHA-256 column, and put the same hash into the VirusTotal link. Once
-     there's a second release, move the previous one into a collapsed
-     <details><summary>Older versions</summary> block below this table. -->
+     SHA-256 column below, and put the same hash into the VirusTotal link.
+     Then move the table you're replacing down into the <details> block,
+     newest-first. -->
+
+**v7.2.1**
+
+| File | SHA-256 | VirusTotal |
+|---|---|---|
+| `molt-7.2.1-windows-x86_64.exe` | `PENDING` | [report](https://www.virustotal.com/gui/file/PENDING) |
+| `molt-7.2.1-linux-x86_64.tar.gz` | `PENDING` | [report](https://www.virustotal.com/gui/file/PENDING) |
+
+<details>
+<summary><b>Older versions</b> (all clean — click to expand)</summary>
 
 **v7.1.1**
 
@@ -52,6 +62,8 @@ Verify a download: `Get-FileHash <file>` (Windows) or `sha256sum <file>` (Linux)
 |---|---|---|
 | `molt-7.1.1-windows-x86_64.exe` | `86fd0cda37c0b820e9263278b8199a4f044003f69ba192b55273ace831c301e4` | [report](https://www.virustotal.com/gui/file/86fd0cda37c0b820e9263278b8199a4f044003f69ba192b55273ace831c301e4) |
 | `molt-7.1.1-linux-x86_64.tar.gz` | `9c72008f16e5fae282c8c519c20a63090d0e3921c15f22361d4d07d2b4ac7012` | [report](https://www.virustotal.com/gui/file/9c72008f16e5fae282c8c519c20a63090d0e3921c15f22361d4d07d2b4ac7012) |
+
+</details>
 
 ## Supported formats
 
