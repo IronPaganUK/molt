@@ -46,15 +46,22 @@ Verify a download: `Get-FileHash <file>` (Windows) or `sha256sum <file>` (Linux)
      Then move the table you're replacing down into the <details> block,
      newest-first. -->
 
+**v7.3.1**
+
+| File | SHA-256 | VirusTotal |
+|---|---|---|
+| `molt-7.3.1-windows-x86_64.exe` | `PENDING` | [report](https://www.virustotal.com/gui/file/PENDING) |
+| `molt-7.3.1-linux-x86_64.tar.gz` | `PENDING` | [report](https://www.virustotal.com/gui/file/PENDING) |
+
+<details>
+<summary><b>Older versions</b> (all clean — click to expand)</summary>
+
 **v7.2.1**
 
 | File | SHA-256 | VirusTotal |
 |---|---|---|
 | `molt-7.2.1-windows-x86_64.exe` | `b1e09bf5211f0affba386b9b46e667c7e9531381a6c51750b3c324d3c8accbce` | [report](https://www.virustotal.com/gui/file/b1e09bf5211f0affba386b9b46e667c7e9531381a6c51750b3c324d3c8accbce) |
 | `molt-7.2.1-linux-x86_64.tar.gz` | `37b6d927c563b2da1c546ad595cde38307ffff473ddc57cce976b9e5a36f0573` | [report](https://www.virustotal.com/gui/file/37b6d927c563b2da1c546ad595cde38307ffff473ddc57cce976b9e5a36f0573) |
-
-<details>
-<summary><b>Older versions</b> (all clean — click to expand)</summary>
 
 **v7.1.1**
 
@@ -122,6 +129,7 @@ Molt ships as **one portable executable** — no installer, no runtime, nothing 
 - When the whole archive has been extracted and verified, the hollow shell is deleted
 - **Drag a row into Explorer** to copy that file out without consuming anything
 - **⚙ → Add to Explorer right-click menu** installs "Open with Molt" / "Molt here" for archives (equivalent to `molt-gui --register`; per-user, no admin needed)
+- **"Molt here"** skips the file browser entirely: a small warning dialog, then it just extracts and consumes the archive. No listing, no toggles — the whole point is that it's already decided.
 
 Extraction runs on a background thread; each file is CRC-verified before its bytes are punched, same as the CLI.
 

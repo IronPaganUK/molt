@@ -1,6 +1,6 @@
 [package]
 name = "molt"
-version = "7.2.1"
+version = "7.3.1"
 edition = "2021"
 build = "build.rs"
 description = "Extract archives without doubling your disk usage — the archive sheds its skin as files emerge."

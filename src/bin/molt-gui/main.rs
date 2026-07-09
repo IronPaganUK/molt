@@ -79,6 +79,9 @@ struct MoltApp {
     password_request: Option<PathBuf>,
     password_input: String,
     password_wrong: bool,
+    /// "Molt here": no file browser, just warn → consume → done. Launched
+    /// via `--molt-here <archive>` from the Explorer context menu.
+    minimal: bool,
 }
 
 impl Default for MoltApp {
@@ -106,6 +109,7 @@ impl Default for MoltApp {
             password_request: None,
             password_input: String::new(),
             password_wrong: false,
+            minimal: false,
         }
     }
 }
@@ -122,8 +126,13 @@ fn default_out_dir(path: &std::path::Path) -> PathBuf {
 impl MoltApp {
     fn open_archive(&mut self, path: PathBuf) {
         let password = self.password.take();
+        let minimal = self.minimal;
         *self = MoltApp::default();
         self.password = password;
+        self.minimal = minimal;
+        if minimal {
+            self.molt_mode = true;
+        }
         self.log = "Reading archive…".into();
         let mut needs_password = false;
         match (|| -> Result<(), String> {
@@ -173,6 +182,9 @@ impl MoltApp {
                 self.pending_title = Some(format!("Molt — {}", fname));
                 self.out_dir = Some(default_out_dir(&path));
                 self.archive_path = Some(path);
+                if self.minimal {
+                    self.confirm_pending = true;
+                }
             }
             Err(e) if needs_password => {
                 self.password_wrong = self.password.is_some();
@@ -417,6 +429,18 @@ impl eframe::App for MoltApp {
             }
         }
 
+        if self.minimal {
+            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.heading("Molt");
+                    if let Some(p) = &self.archive_path {
+                        ui.weak(p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+                    }
+                });
+                ui.add_space(4.0);
+            });
+        } else {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -476,6 +500,7 @@ impl eframe::App for MoltApp {
             });
             ui.add_space(4.0);
         });
+        }
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.add_space(2.0);
@@ -500,6 +525,47 @@ impl eframe::App for MoltApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            if self.minimal {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        if self.password_request.is_some() {
+                            // The password window (below) covers this.
+                        } else if self.confirm_pending {
+                            ui.label("⚠ Molt will CONSUME this archive as it extracts.");
+                            ui.label(
+                                "Each entry is verified before its bytes are freed. There is no undo.",
+                            );
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Consume it").clicked() {
+                                    self.confirm_pending = false;
+                                    self.start_extraction();
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                            });
+                        } else if self.busy {
+                            ui.label(format!(
+                                "Extracting… {}/{}",
+                                self.jobs_done, self.jobs_total
+                            ));
+                            ui.add_space(4.0);
+                            ui.weak(&self.log);
+                        } else {
+                            // Done (archive consumed, kept after a failure,
+                            // or never opened in the first place).
+                            ui.label(&self.log);
+                            ui.add_space(12.0);
+                            if ui.button("Close").clicked() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        }
+                    });
+                });
+                return;
+            }
+
             if self.entries.is_empty() {
                 ui.centered_and_justified(|ui| {
                     if self.archive_path.is_some() {
@@ -649,8 +715,9 @@ impl eframe::App for MoltApp {
                 });
         }
 
-        // Destructive-action confirmation
-        if self.confirm_pending {
+        // Destructive-action confirmation (minimal mode renders this inline
+        // in the central panel instead — there's no file browser to overlay).
+        if self.confirm_pending && !self.minimal {
             egui::Window::new("Consume archive?")
                 .collapsible(false)
                 .resizable(false)
@@ -721,12 +788,18 @@ fn main() -> Result<(), eframe::Error> {
         None => (false, None),
     };
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+    let viewport = if molt_here {
+        // A small fixed-size dialog, not the full file browser.
+        egui::ViewportBuilder::default()
+            .with_inner_size([420.0, 220.0])
+            .with_resizable(false)
+    } else {
+        egui::ViewportBuilder::default()
             .with_inner_size([680.0, 440.0])
             .with_min_inner_size([560.0, 360.0])
-            .with_drag_and_drop(true)
-            .with_icon(load_icon()),
+    };
+    let options = eframe::NativeOptions {
+        viewport: viewport.with_drag_and_drop(true).with_icon(load_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -734,14 +807,12 @@ fn main() -> Result<(), eframe::Error> {
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            let mut app = MoltApp::default();
+            let mut app = MoltApp { minimal: molt_here, ..MoltApp::default() };
             // Support `molt-gui archive.zip` / "Open with…" / "Molt here"
+            // (open_archive arms the consume-confirmation itself in
+            // minimal mode, including after a password prompt).
             if let Some(arg) = archive_arg {
                 app.open_archive(PathBuf::from(arg));
-                if molt_here && app.archive_path.is_some() {
-                    app.molt_mode = true;
-                    app.confirm_pending = true;
-                }
             }
             Ok(Box::new(app))
         }),
