@@ -429,18 +429,9 @@ impl eframe::App for MoltApp {
             }
         }
 
-        if self.minimal {
-            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.heading("Molt");
-                    if let Some(p) = &self.archive_path {
-                        ui.weak(p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
-                    }
-                });
-                ui.add_space(4.0);
-            });
-        } else {
+        // Minimal ("Molt here") mode is a bare centered dialog — no toolbar,
+        // no status bar, just the message and buttons in the central panel.
+        if !self.minimal {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -500,7 +491,6 @@ impl eframe::App for MoltApp {
             });
             ui.add_space(4.0);
         });
-        }
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.add_space(2.0);
@@ -523,46 +513,57 @@ impl eframe::App for MoltApp {
             });
             ui.add_space(2.0);
         });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.minimal {
-                ui.centered_and_justified(|ui| {
+                let full_w = ui.available_width();
+                const BW: f32 = 88.0; // button width
+                const BH: f32 = 28.0; // button height
+
+                if self.password_request.is_some() {
+                    // The password window (below) covers this frame.
+                } else if self.confirm_pending {
+                    ui.add_space(28.0);
                     ui.vertical_centered(|ui| {
-                        if self.password_request.is_some() {
-                            // The password window (below) covers this.
-                        } else if self.confirm_pending {
-                            ui.label("⚠ Molt will CONSUME this archive as it extracts.");
-                            ui.label(
-                                "Each entry is verified before its bytes are freed. There is no undo.",
-                            );
-                            ui.add_space(12.0);
-                            ui.horizontal(|ui| {
-                                if ui.button("Consume it").clicked() {
-                                    self.confirm_pending = false;
-                                    self.start_extraction();
-                                }
-                                if ui.button("Cancel").clicked() {
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                                }
-                            });
-                        } else if self.busy {
-                            ui.label(format!(
-                                "Extracting… {}/{}",
-                                self.jobs_done, self.jobs_total
-                            ));
-                            ui.add_space(4.0);
-                            ui.weak(&self.log);
-                        } else {
-                            // Done (archive consumed, kept after a failure,
-                            // or never opened in the first place).
-                            ui.label(&self.log);
-                            ui.add_space(12.0);
-                            if ui.button("Close").clicked() {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            }
+                        ui.label(
+                            egui::RichText::new("Molt will extract and consume this archive.")
+                                .strong(),
+                        );
+                        ui.add_space(2.0);
+                        ui.label("Are you sure?");
+                    });
+                    ui.add_space(20.0);
+                    ui.horizontal(|ui| {
+                        let gap = ui.spacing().item_spacing.x;
+                        ui.add_space(((full_w - (BW * 2.0 + gap)) * 0.5).max(0.0));
+                        if ui.add_sized([BW, BH], egui::Button::new("Confirm")).clicked() {
+                            self.confirm_pending = false;
+                            self.start_extraction();
+                        }
+                        if ui.add_sized([BW, BH], egui::Button::new("Cancel")).clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     });
-                });
+                } else if self.busy {
+                    ui.add_space(52.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(format!("Extracting… {}/{}", self.jobs_done, self.jobs_total));
+                    });
+                } else {
+                    // Done (consumed, kept after a failure, or never opened).
+                    ui.add_space(34.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(&self.log);
+                    });
+                    ui.add_space(18.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(((full_w - BW) * 0.5).max(0.0));
+                        if ui.add_sized([BW, BH], egui::Button::new("Close")).clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+                }
                 return;
             }
 
@@ -789,9 +790,9 @@ fn main() -> Result<(), eframe::Error> {
     };
 
     let viewport = if molt_here {
-        // A small fixed-size dialog, not the full file browser.
+        // A small fixed-size confirm dialog, not the full file browser.
         egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 220.0])
+            .with_inner_size([380.0, 160.0])
             .with_resizable(false)
     } else {
         egui::ViewportBuilder::default()
@@ -800,6 +801,8 @@ fn main() -> Result<(), eframe::Error> {
     };
     let options = eframe::NativeOptions {
         viewport: viewport.with_drag_and_drop(true).with_icon(load_icon()),
+        // Center the "Molt here" dialog on the screen.
+        centered: molt_here,
         ..Default::default()
     };
     eframe::run_native(
