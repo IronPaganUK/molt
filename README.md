@@ -48,15 +48,22 @@ Verify a download: `Get-FileHash <file>` (Windows) or `sha256sum <file>` (Linux)
      Then move the table you're replacing down into the <details> block,
      newest-first. -->
 
+**v7.3.5**
+
+| File | SHA-256 | VirusTotal |
+|---|---|---|
+| `molt-7.3.5-windows-x86_64.exe` | `PENDING` | [report](https://www.virustotal.com/gui/file/PENDING) |
+| `molt-7.3.5-linux-x86_64.tar.gz` | `PENDING` | [report](https://www.virustotal.com/gui/file/PENDING) |
+
+<details>
+<summary><b>Older versions</b> (click to expand)</summary>
+
 **v7.3.4**
 
 | File | SHA-256 | VirusTotal |
 |---|---|---|
 | `molt-7.3.4-windows-x86_64.exe` | `2a02da647069c7921c6e3194ad7cca005fa994f8ac9195d32f87fae36538688e` | [report](https://www.virustotal.com/gui/file/2a02da647069c7921c6e3194ad7cca005fa994f8ac9195d32f87fae36538688e) |
 | `molt-7.3.4-linux-x86_64.tar.gz` | `5bbb435116c7930907fa49feee1ad15912d3ac97504927f0fb864d1aae89dde3` | [report](https://www.virustotal.com/gui/file/5bbb435116c7930907fa49feee1ad15912d3ac97504927f0fb864d1aae89dde3) |
-
-<details>
-<summary><b>Older versions</b> (click to expand)</summary>
 
 **v7.3.3**
 
@@ -108,7 +115,7 @@ Verify a download: `Get-FileHash <file>` (Windows) or `sha256sum <file>` (Linux)
 Formats are detected by content, not extension. Notes:
 
 - **Solid archives** (solid rar, multi-entry 7z blocks, all tar streams) decompress front-to-back, which is exactly the access pattern hole punching wants — but partial extraction can't free space, because later entries need the earlier compressed bytes. Molt tells you when that's the case and extracts without freeing.
-- **Encrypted archives are supported**: zip (ZipCrypto and AES), 7z (including encrypted headers), and rar. The CLI prompts for the password (or takes `--password`); the GUI shows a password dialog. Nothing is ever freed on a wrong password — entries fail verification before any punching. One limit: header-encrypted **rar** extracts fine but can't free space as it goes (the entry offsets can't be mapped), so the emptied archive is left for you to delete.
+- **Encrypted archives are supported**: zip (ZipCrypto and AES), 7z (including encrypted headers), and rar. The CLI prompts for the password (or takes `--password`); the GUI shows a password dialog. Nothing is ever freed on a wrong password — entries fail verification before any punching. One limit: for **header-encrypted rar** the entry offsets can't be mapped, so space isn't freed incrementally *during* extraction — but the archive is still consumed (deleted) once every file is safely out, same as any other molt run.
 - **Multi-volume rar** archives are not supported.
 - Listing a tar stream requires one decompression pass, so opening a huge `.tar.gz` takes a moment before extraction starts.
 

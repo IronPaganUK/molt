@@ -155,11 +155,16 @@ impl Backend for RarBackend {
             ));
         }
         if opts.molt && self.ranges.is_empty() {
-            on(Event::Note(match &self.parse_diag {
-                Some(reason) => format!(
-                    "could not map this rar's entry offsets ({reason}); extracting without freeing"
-                ),
-                None => "could not map this rar's entry offsets; extracting without freeing".into(),
+            // We can't punch incrementally without the byte ranges, but a
+            // successful full extraction is still consumed: the archive is
+            // deleted at the end (see `all_out` below).
+            let why = self.parse_diag.as_deref().unwrap_or("offsets unavailable");
+            on(Event::Note(if full_run {
+                format!(
+                    "can't free this rar as it extracts ({why}); it will be deleted once every file is safely out"
+                )
+            } else {
+                format!("can't free this rar's space ({why}); extracting without freeing")
             }));
         }
 
@@ -310,7 +315,12 @@ impl Backend for RarBackend {
             index += 1;
         }
 
-        let all_out = opts.molt && failed == 0 && full_run && !self.ranges.is_empty();
+        // A fully successful molt run consumes the archive even when we
+        // couldn't punch incrementally (e.g. header-encrypted rar): unrar
+        // verifies every entry's CRC on extraction, so deleting the now-
+        // redundant archive is safe. Incremental freeing is a bonus we only
+        // get when the entry offsets are mappable.
+        let all_out = opts.molt && failed == 0 && full_run;
         Ok(Summary { failed, resumed, freed, all_out })
     }
 }
