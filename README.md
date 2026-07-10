@@ -52,8 +52,8 @@ Verify a download: `Get-FileHash <file>` (Windows) or `sha256sum <file>` (Linux)
 
 | File | SHA-256 | VirusTotal |
 |---|---|---|
-| `molt-7.3.3-windows-x86_64.exe` | `PENDING` | [report](https://www.virustotal.com/gui/file/PENDING) |
-| `molt-7.3.3-linux-x86_64.tar.gz` | `PENDING` | [report](https://www.virustotal.com/gui/file/PENDING) |
+| `molt-7.3.3-windows-x86_64.exe` | `477587de0fade92eb4104c60a882a9270460714c6e86d0b9fd5a5bc4fca74f37` | [report](https://www.virustotal.com/gui/file/477587de0fade92eb4104c60a882a9270460714c6e86d0b9fd5a5bc4fca74f37) |
+| `molt-7.3.3-linux-x86_64.tar.gz` | `13e296d644147a47e3562241542ccc1042eaa2edc14cc1b2d6a462d03213890d` | [report](https://www.virustotal.com/gui/file/13e296d644147a47e3562241542ccc1042eaa2edc14cc1b2d6a462d03213890d) |
 
 <details>
 <summary><b>Older versions</b> (click to expand)</summary>
