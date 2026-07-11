@@ -50,7 +50,7 @@ enum Msg {
     Error { index: usize, err: String },
     Note(String),
     Fatal(String),
-    Finished { archive_deleted: bool },
+    Finished { archive_deleted: bool, reclaimed: u64 },
 }
 
 // ---------------------------------------------------------------------- app
@@ -219,7 +219,13 @@ impl MoltApp {
         self.busy = true;
 
         thread::spawn(move || {
-            let result = (|| -> Result<bool, String> {
+            // The archive's size — what's reclaimed when the run consumes
+            // it, whether the bytes were punched incrementally or freed by
+            // the final delete. (summary.freed counts only the incremental
+            // punching, which is 0 for formats we can't punch, e.g. header-
+            // encrypted rar — that was the "0 B reclaimed" bug.)
+            let archive_size = fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
+            let result = (|| -> Result<(bool, u64), String> {
                 let mut backend =
                     formats::open_with_password(&archive, password.as_deref())
                         .map_err(|e| e.to_string())?;
@@ -250,15 +256,18 @@ impl MoltApp {
                     drop(backend);
                     deleted = fs::remove_file(&archive).is_ok();
                 }
-                Ok(deleted)
+                // Consumed → the whole archive came back; otherwise report
+                // just the bytes punched so far.
+                let reclaimed = if deleted { archive_size } else { summary.freed };
+                Ok((deleted, reclaimed))
             })();
             match result {
-                Ok(deleted) => {
-                    let _ = tx.send(Msg::Finished { archive_deleted: deleted });
+                Ok((deleted, reclaimed)) => {
+                    let _ = tx.send(Msg::Finished { archive_deleted: deleted, reclaimed });
                 }
                 Err(e) => {
                     let _ = tx.send(Msg::Fatal(e));
-                    let _ = tx.send(Msg::Finished { archive_deleted: false });
+                    let _ = tx.send(Msg::Finished { archive_deleted: false, reclaimed: 0 });
                 }
             }
         });
@@ -377,9 +386,13 @@ impl MoltApp {
                 }
                 Msg::Note(m) => self.log = m,
                 Msg::Fatal(e) => self.log = format!("Extraction failed: {e}"),
-                Msg::Finished { archive_deleted } => {
+                Msg::Finished { archive_deleted, reclaimed } => {
                     finished = true;
                     self.busy = false;
+                    // Authoritative total from the worker (whole footprint on
+                    // consume, punched bytes otherwise) — keeps the counter
+                    // right even for formats we can't punch incrementally.
+                    self.freed = reclaimed;
                     if archive_deleted {
                         self.log =
                             format!("Done — {} reclaimed, archive fully consumed.", human(self.freed));

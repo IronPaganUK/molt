@@ -228,11 +228,16 @@ fn run(opts: &Options) -> io::Result<()> {
 
     if summary.all_out {
         fs::remove_file(&opts.archive)?;
+        // Consuming the archive returns its whole footprint — reported as the
+        // archive's size, since that's what's reclaimed whether the bytes
+        // were punched incrementally or freed by the final delete. (freed
+        // only counts incremental punching, which is 0 for formats we can't
+        // punch, e.g. header-encrypted rar — that was the "0 B" bug.)
         println!(
             "\ndone in {:.1?} — {} extracted, {} freed, archive consumed{}.",
             started.elapsed(),
             human(total_uncompressed),
-            human(summary.freed),
+            human(archive_size),
             if summary.resumed > 0 {
                 format!(" ({} entries were already out from an earlier run)", summary.resumed)
             } else {
