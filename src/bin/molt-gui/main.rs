@@ -6,6 +6,8 @@
 mod dragout;
 #[cfg(windows)]
 mod shell;
+#[cfg(windows)]
+mod update;
 
 use eframe::egui;
 use molt::formats::{self, Event};
@@ -82,6 +84,35 @@ struct MoltApp {
     /// "Molt here": no file browser, just warn → consume → done. Launched
     /// via `--molt-here <archive>` from the Explorer context menu.
     minimal: bool,
+    /// Self-updater state and the channel a background check/download reports on.
+    #[cfg(windows)]
+    update: UpdateUi,
+    #[cfg(windows)]
+    update_rx: Option<Receiver<UpdateMsg>>,
+}
+
+// ------------------------------------------------------------- self-update UI
+
+#[cfg(windows)]
+#[derive(Default)]
+enum UpdateUi {
+    /// No update dialog showing.
+    #[default]
+    Hidden,
+    Checking,
+    UpToDate(String),
+    Available(update::Update),
+    Downloading { got: u64, total: Option<u64> },
+    Failed(String),
+}
+
+#[cfg(windows)]
+enum UpdateMsg {
+    Result(Result<update::Check, String>),
+    Progress { got: u64, total: Option<u64> },
+    /// The exe was replaced; relaunch is imminent.
+    Applied,
+    ApplyFailed(String),
 }
 
 impl Default for MoltApp {
@@ -110,6 +141,10 @@ impl Default for MoltApp {
             password_input: String::new(),
             password_wrong: false,
             minimal: false,
+            #[cfg(windows)]
+            update: UpdateUi::Hidden,
+            #[cfg(windows)]
+            update_rx: None,
         }
     }
 }
@@ -345,6 +380,95 @@ impl MoltApp {
         }
     }
 
+    // ------------------------------------------------------------- updates
+
+    /// Kick off a background "check for updates" (does nothing if one is
+    /// already running).
+    #[cfg(windows)]
+    fn start_update_check(&mut self) {
+        if matches!(self.update, UpdateUi::Checking | UpdateUi::Downloading { .. }) {
+            return;
+        }
+        self.update = UpdateUi::Checking;
+        let (tx, rx) = channel();
+        self.update_rx = Some(rx);
+        thread::spawn(move || {
+            let _ = tx.send(UpdateMsg::Result(update::check()));
+        });
+    }
+
+    /// Download and install the given update on a background thread.
+    #[cfg(windows)]
+    fn start_update_apply(&mut self, upd: update::Update) {
+        self.update = UpdateUi::Downloading { got: 0, total: None };
+        let (tx, rx) = channel();
+        self.update_rx = Some(rx);
+        thread::spawn(move || {
+            let ptx = tx.clone();
+            let result = update::download_and_apply(&upd, |got, total| {
+                let _ = ptx.send(UpdateMsg::Progress { got, total });
+            });
+            match result {
+                Ok(()) => {
+                    let _ = tx.send(UpdateMsg::Applied);
+                }
+                Err(e) => {
+                    let _ = tx.send(UpdateMsg::ApplyFailed(e));
+                }
+            }
+        });
+    }
+
+    /// True while a check/download is in flight (keeps the UI repainting).
+    #[cfg(windows)]
+    fn update_active(&self) -> bool {
+        matches!(self.update, UpdateUi::Checking | UpdateUi::Downloading { .. })
+    }
+    #[cfg(not(windows))]
+    fn update_active(&self) -> bool {
+        false
+    }
+
+    #[cfg(windows)]
+    fn pump_update(&mut self) {
+        let Some(rx) = &self.update_rx else { return };
+        let mut done = false;
+        let mut relaunch = false;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                UpdateMsg::Result(Ok(update::Check::Available(u))) => {
+                    self.update = UpdateUi::Available(u);
+                    done = true;
+                }
+                UpdateMsg::Result(Ok(update::Check::UpToDate(v))) => {
+                    self.update = UpdateUi::UpToDate(v);
+                    done = true;
+                }
+                UpdateMsg::Result(Err(e)) => {
+                    self.update = UpdateUi::Failed(e);
+                    done = true;
+                }
+                UpdateMsg::Progress { got, total } => {
+                    self.update = UpdateUi::Downloading { got, total };
+                }
+                UpdateMsg::Applied => {
+                    relaunch = true;
+                }
+                UpdateMsg::ApplyFailed(e) => {
+                    self.update = UpdateUi::Failed(e);
+                    done = true;
+                }
+            }
+        }
+        if relaunch {
+            // Exe already swapped on disk → start the new one and quit.
+            update::relaunch();
+        }
+        if done {
+            self.update_rx = None;
+        }
+    }
+
     fn pump_messages(&mut self) {
         let Some(rx) = &self.rx else { return };
         let mut finished = false;
@@ -426,7 +550,9 @@ impl eframe::App for MoltApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_messages();
-        if self.busy {
+        #[cfg(windows)]
+        self.pump_update();
+        if self.busy || self.update_active() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         if let Some(t) = self.pending_title.take() {
@@ -497,6 +623,11 @@ impl eframe::App for MoltApp {
                                 Ok(()) => "Removed from the right-click menu.".into(),
                                 Err(e) => format!("Could not unregister: {e}"),
                             };
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Check for updates…").clicked() {
+                            self.start_update_check();
                             ui.close_menu();
                         }
                     });
@@ -752,7 +883,104 @@ impl eframe::App for MoltApp {
                     });
                 });
         }
+
+        #[cfg(windows)]
+        self.update_dialog(ctx);
     }
+}
+
+#[cfg(windows)]
+impl MoltApp {
+    /// The "Check for updates" modal. Renders whatever state the updater is
+    /// in and drives the Update-now / dismiss actions.
+    fn update_dialog(&mut self, ctx: &egui::Context) {
+        if matches!(self.update, UpdateUi::Hidden) {
+            return;
+        }
+        let mut dismiss = false;
+        let mut apply: Option<update::Update> = None;
+        egui::Window::new("Software update")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                match &self.update {
+                    UpdateUi::Hidden => {}
+                    UpdateUi::Checking => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Checking for updates…");
+                        });
+                    }
+                    UpdateUi::UpToDate(v) => {
+                        ui.label(format!("You're on the latest version ({v})."));
+                        ui.add_space(8.0);
+                        if ui.button("OK").clicked() {
+                            dismiss = true;
+                        }
+                    }
+                    UpdateUi::Available(u) => {
+                        ui.label(
+                            egui::RichText::new(format!("Version {} is available.", u.version))
+                                .strong(),
+                        );
+                        ui.label(format!("You have {}.", update::current_version()));
+                        ui.add_space(6.0);
+                        ui.weak("Downloads the new build, verifies it, and restarts Molt.");
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Update now").clicked() {
+                                apply = Some(u.clone());
+                            }
+                            if ui.button("Later").clicked() {
+                                dismiss = true;
+                            }
+                            if !u.notes_url.is_empty()
+                                && ui.button("Release notes").clicked()
+                            {
+                                let _ = open_url(&u.notes_url);
+                            }
+                        });
+                    }
+                    UpdateUi::Downloading { got, total } => {
+                        let frac = total.map(|t| *got as f32 / t.max(1) as f32);
+                        ui.label("Downloading update…");
+                        ui.add_space(4.0);
+                        let bar = match frac {
+                            Some(f) => egui::ProgressBar::new(f).show_percentage(),
+                            None => egui::ProgressBar::new(0.0)
+                                .animate(true)
+                                .text(human(*got)),
+                        };
+                        ui.add(bar.desired_width(240.0));
+                    }
+                    UpdateUi::Failed(e) => {
+                        ui.colored_label(egui::Color32::from_rgb(230, 120, 120), "Update failed");
+                        ui.label(e.as_str());
+                        ui.add_space(8.0);
+                        if ui.button("OK").clicked() {
+                            dismiss = true;
+                        }
+                    }
+                }
+                ui.add_space(2.0);
+            });
+        if dismiss {
+            self.update = UpdateUi::Hidden;
+        }
+        if let Some(u) = apply {
+            self.start_update_apply(u);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn open_url(url: &str) -> std::io::Result<()> {
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn()
+        .map(|_| ())
 }
 
 fn load_icon() -> egui::IconData {

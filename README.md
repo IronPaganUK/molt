@@ -48,15 +48,22 @@ Verify a download: `Get-FileHash <file>` (Windows) or `sha256sum <file>` (Linux)
      Then move the table you're replacing down into the <details> block,
      newest-first. -->
 
+**v8.1.1**
+
+| File | SHA-256 | VirusTotal |
+|---|---|---|
+| `molt-8.1.1-windows-x86_64.exe` | `PENDING` | [report](https://www.virustotal.com/gui/file/PENDING) |
+| `molt-8.1.1-linux-x86_64.tar.gz` | `PENDING` | [report](https://www.virustotal.com/gui/file/PENDING) |
+
+<details>
+<summary><b>Older versions</b> (click to expand)</summary>
+
 **v7.3.6**
 
 | File | SHA-256 | VirusTotal |
 |---|---|---|
 | `molt-7.3.6-windows-x86_64.exe` | `f115906de6ffe4ab6b0c47fc1ce0d7a24287adcc31ed4fef1623d5b44fa9fab9` | [report](https://www.virustotal.com/gui/file/f115906de6ffe4ab6b0c47fc1ce0d7a24287adcc31ed4fef1623d5b44fa9fab9) |
 | `molt-7.3.6-linux-x86_64.tar.gz` | `e7de52ae287223f71199b00aac64474e979504e5fc105a424568907e1747b193` | [report](https://www.virustotal.com/gui/file/e7de52ae287223f71199b00aac64474e979504e5fc105a424568907e1747b193) |
-
-<details>
-<summary><b>Older versions</b> (click to expand)</summary>
 
 **v7.3.5**
 
@@ -167,6 +174,7 @@ Molt ships as **one portable executable** — no installer, no runtime, nothing 
 - **Drag a row into Explorer** to copy that file out without consuming anything
 - **⚙ → Add to Explorer right-click menu** installs "Open with Molt" / "Molt here" for archives (equivalent to `molt-gui --register`; per-user, no admin needed)
 - **"Molt here"** skips the file browser entirely: a small warning dialog, then it just extracts and consumes the archive. No listing, no toggles — the whole point is that it's already decided.
+- **⚙ → Check for updates** — Molt updates itself. It checks the latest GitHub release, and if there's a newer version, downloads it, **verifies the download's SHA-256 against the hash in the release notes** before touching anything, replaces the running executable in place, and restarts. Because it swaps the exe at the same path, your right-click integration keeps working — no re-register. The check is a single request to GitHub's public API and only happens when you click it; nothing phones home on its own. (Windows only.)
 
 Extraction runs on a background thread; each file is CRC-verified before its bytes are punched, same as the CLI.
 
