@@ -48,15 +48,22 @@ Verify a download: `Get-FileHash <file>` (Windows) or `sha256sum <file>` (Linux)
      Then move the table you're replacing down into the <details> block,
      newest-first. -->
 
+**v9.1.1**
+
+| File | SHA-256 | VirusTotal |
+|---|---|---|
+| `molt-9.1.1-windows-x86_64.exe` | `4443c74a2bdbd7565aaea6f8532d9bcfa0002ed23e788171eba834abc73b9b3e` | [report](https://www.virustotal.com/gui/file/4443c74a2bdbd7565aaea6f8532d9bcfa0002ed23e788171eba834abc73b9b3e) |
+| `molt-9.1.1-linux-x86_64.tar.gz` | `661262a0bec8187399936b4d48a6be5b7be928cb936d925b0c273e7254b18b78` | [report](https://www.virustotal.com/gui/file/661262a0bec8187399936b4d48a6be5b7be928cb936d925b0c273e7254b18b78) |
+
+<details>
+<summary><b>Older versions</b> (click to expand)</summary>
+
 **v8.1.1**
 
 | File | SHA-256 | VirusTotal |
 |---|---|---|
 | `molt-8.1.1-windows-x86_64.exe` | `875526501d3cab323632207f8d268e1592c38668aad40551cf9fe1db64a1c9c1` | [report](https://www.virustotal.com/gui/file/875526501d3cab323632207f8d268e1592c38668aad40551cf9fe1db64a1c9c1) |
 | `molt-8.1.1-linux-x86_64.tar.gz` | `ad484cd4e53383aa5ef3f49950455115ae23ebac73451725397ce3bb8d31069e` | [report](https://www.virustotal.com/gui/file/ad484cd4e53383aa5ef3f49950455115ae23ebac73451725397ce3bb8d31069e) |
-
-<details>
-<summary><b>Older versions</b> (click to expand)</summary>
 
 **v7.3.6**
 
