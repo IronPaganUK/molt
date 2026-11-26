@@ -6,14 +6,16 @@
 mod dragout;
 #[cfg(windows)]
 mod shell;
+mod theme;
 #[cfg(windows)]
 mod update;
 
-use eframe::egui;
+use eframe::egui::{self, Align, Color32, Layout, RichText, Sense, Stroke, Vec2};
 use molt::formats::{self, Event};
 use molt::util::human;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use theme::dim;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
@@ -42,6 +44,36 @@ enum Status {
     Failed,
 }
 
+/// How the status-line message should read: plain, good news, heads-up, or
+/// a failure. Drives the colour and icon in the status bar.
+#[derive(Clone, Copy, PartialEq, Default)]
+enum Tone {
+    #[default]
+    Info,
+    Ok,
+    Warn,
+    Err,
+}
+
+impl Tone {
+    fn color(self) -> Color32 {
+        match self {
+            Tone::Info => theme::TEXT_DIM,
+            Tone::Ok => theme::OK,
+            Tone::Warn => theme::WARN,
+            Tone::Err => theme::ERR,
+        }
+    }
+    fn icon(self) -> &'static str {
+        match self {
+            Tone::Info => "",
+            Tone::Ok => "✔",
+            Tone::Warn => "⚠",
+            Tone::Err => "✖",
+        }
+    }
+}
+
 // -------------------------------------------------------------- worker msgs
 
 enum Msg {
@@ -59,6 +91,11 @@ enum Msg {
 
 struct MoltApp {
     archive_path: Option<PathBuf>,
+    /// File name of the open archive; kept after it's consumed so the
+    /// header can still say what was molted.
+    archive_name: String,
+    /// The last run consumed the archive (it's gone from disk).
+    consumed: bool,
     kind: &'static str,
     entries: Vec<Entry>,
     archive_size: u64,
@@ -68,6 +105,9 @@ struct MoltApp {
     rx: Option<Receiver<Msg>>,
     busy: bool,
     log: String,
+    tone: Tone,
+    /// App icon as a texture, for the header and the "Molt here" dialog.
+    logo: Option<egui::TextureHandle>,
     confirm_pending: bool,
     pending_title: Option<String>,
     jobs_total: usize,
@@ -119,6 +159,8 @@ impl Default for MoltApp {
     fn default() -> Self {
         Self {
             archive_path: None,
+            archive_name: String::new(),
+            consumed: false,
             kind: "",
             entries: Vec::new(),
             archive_size: 0,
@@ -127,9 +169,9 @@ impl Default for MoltApp {
             out_dir: None,
             rx: None,
             busy: false,
-            log: String::from(
-                "Open an archive (zip, 7z, rar, tar.*, gz…), or drag one onto this window.",
-            ),
+            log: String::from("Ready."),
+            tone: Tone::Info,
+            logo: None,
             confirm_pending: false,
             pending_title: None,
             jobs_total: 0,
@@ -159,16 +201,90 @@ fn default_out_dir(path: &std::path::Path) -> PathBuf {
 }
 
 impl MoltApp {
+    fn say(&mut self, tone: Tone, msg: impl Into<String>) {
+        self.tone = tone;
+        self.log = msg.into();
+    }
+
+    fn logo_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        self.logo
+            .get_or_insert_with(|| {
+                let icon = load_icon();
+                ctx.load_texture(
+                    "molt-logo",
+                    egui::ColorImage::from_rgba_unmultiplied([64, 64], &icon.rgba),
+                    egui::TextureOptions::LINEAR,
+                )
+            })
+            .clone()
+    }
+
+    /// Ask for an archive with the system file picker and open it.
+    fn pick_archive(&mut self) {
+        if let Some(p) = rfd::FileDialog::new()
+            .add_filter("Archives", ARCHIVE_EXTS)
+            .add_filter("All files", &["*"])
+            .pick_file()
+        {
+            self.open_archive(p);
+        }
+    }
+
+    fn pick_destination(&mut self) {
+        let mut dlg = rfd::FileDialog::new();
+        if let Some(parent) = self.out_dir.as_deref().and_then(Path::parent) {
+            dlg = dlg.set_directory(parent);
+        }
+        if let Some(d) = dlg.pick_folder() {
+            self.out_dir = Some(d);
+        }
+    }
+
+    /// Files (not folders) in the archive.
+    fn files(&self) -> impl Iterator<Item = &Entry> {
+        self.entries.iter().filter(|e| !e.is_dir)
+    }
+
+    /// Ticked files that haven't been extracted yet — what the next run does.
+    fn to_extract(&self) -> (usize, u64) {
+        self.files()
+            .filter(|e| e.selected && e.status == Status::Pending)
+            .fold((0, 0), |(n, b), e| (n + 1, b + e.size))
+    }
+
+    /// A dialog is up; everything behind it is blocked.
+    fn modal_open(&self) -> bool {
+        #[cfg(windows)]
+        let updating = !matches!(self.update, UpdateUi::Hidden);
+        #[cfg(not(windows))]
+        let updating = false;
+        self.password_request.is_some() || (self.confirm_pending && !self.minimal) || updating
+    }
+
     fn open_archive(&mut self, path: PathBuf) {
-        let password = self.password.take();
-        let minimal = self.minimal;
-        *self = MoltApp::default();
-        self.password = password;
-        self.minimal = minimal;
-        if minimal {
+        // A fresh slate, minus what belongs to the session rather than to
+        // the previous archive.
+        let fresh = MoltApp {
+            password: self.password.take(),
+            minimal: self.minimal,
+            logo: self.logo.take(),
+            drag_temp_dirs: std::mem::take(&mut self.drag_temp_dirs),
+            drag_seq: self.drag_seq,
+            #[cfg(windows)]
+            update: std::mem::take(&mut self.update),
+            #[cfg(windows)]
+            update_rx: self.update_rx.take(),
+            ..MoltApp::default()
+        };
+        *self = fresh;
+        if self.minimal {
             self.molt_mode = true;
         }
-        self.log = "Reading archive…".into();
+        self.archive_name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.say(Tone::Info, "Reading archive…");
         let mut needs_password = false;
         match (|| -> Result<(), String> {
             self.archive_size = fs::metadata(&path).map_err(|e| e.to_string())?.len();
@@ -199,22 +315,11 @@ impl MoltApp {
                 self.password_wrong = self.password.is_some();
                 self.password = None;
                 self.password_request = Some(path);
+                self.say(Tone::Info, "This archive is password-protected.");
             }
             Ok(()) => {
-                let total: u64 = self.entries.iter().map(|e| e.size).sum();
-                let fname = path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                self.log = format!(
-                    "{} ({}) — {} entries, {} compressed, {} extracted.",
-                    fname,
-                    self.kind,
-                    self.entries.iter().filter(|e| !e.is_dir).count(),
-                    human(self.archive_size),
-                    human(total),
-                );
-                self.pending_title = Some(format!("Molt — {}", fname));
+                self.say(Tone::Info, "Ready — untick anything you don't need.");
+                self.pending_title = Some(format!("Molt — {}", self.archive_name));
                 self.out_dir = Some(default_out_dir(&path));
                 self.archive_path = Some(path);
                 if self.minimal {
@@ -225,9 +330,12 @@ impl MoltApp {
                 self.password_wrong = self.password.is_some();
                 self.password = None;
                 self.password_request = Some(path);
-                self.log = e;
+                self.say(Tone::Warn, e);
             }
-            Err(e) => self.log = format!("Could not open archive: {e}"),
+            Err(e) => {
+                self.archive_name.clear();
+                self.say(Tone::Err, format!("Couldn't open that archive: {e}"));
+            }
         }
     }
 
@@ -243,9 +351,10 @@ impl MoltApp {
             .collect();
         let n_selected = selected.iter().filter(|&&s| s).count();
         if n_selected == 0 {
-            self.log = "Nothing selected.".into();
+            self.say(Tone::Warn, "Nothing selected — tick at least one file.");
             return;
         }
+        self.say(Tone::Info, "Extracting…");
         self.jobs_total = n_selected;
         self.jobs_done = 0;
 
@@ -365,17 +474,20 @@ impl MoltApp {
                 self.drag_temp_dirs.push(tmp);
                 let n = paths.len();
                 if dragout::start_drag(&paths) {
-                    self.log = format!(
-                        "Dragged {n} file{} out — copies, the archive is unchanged.",
-                        if n == 1 { "" } else { "s" }
+                    self.say(
+                        Tone::Ok,
+                        format!(
+                            "Copied {n} file{} out — the archive is unchanged.",
+                            if n == 1 { "" } else { "s" }
+                        ),
                     );
                 } else {
-                    self.log = "Drag cancelled.".into();
+                    self.say(Tone::Info, "Drag cancelled.");
                 }
             }
             Err(e) => {
                 let _ = fs::remove_dir_all(&tmp);
-                self.log = format!("Drag-out failed: {e}");
+                self.say(Tone::Err, format!("Drag-out failed: {e}"));
             }
         }
     }
@@ -470,7 +582,8 @@ impl MoltApp {
     }
 
     fn pump_messages(&mut self) {
-        let Some(rx) = &self.rx else { return };
+        // Taken out while draining so the handlers below can borrow `self`.
+        let Some(rx) = self.rx.take() else { return };
         let mut finished = false;
         while let Ok(msg) = rx.try_recv() {
             match msg {
@@ -505,11 +618,12 @@ impl MoltApp {
                     self.jobs_done += 1;
                     if let Some(e) = self.entries.get_mut(index) {
                         e.status = Status::Failed;
-                        self.log = format!("{}: {}", e.name, err);
+                        let msg = format!("{}: {}", e.name, err);
+                        self.say(Tone::Err, msg);
                     }
                 }
-                Msg::Note(m) => self.log = m,
-                Msg::Fatal(e) => self.log = format!("Extraction failed: {e}"),
+                Msg::Note(m) => self.say(Tone::Warn, m),
+                Msg::Fatal(e) => self.say(Tone::Err, format!("Extraction failed: {e}")),
                 Msg::Finished { archive_deleted, reclaimed } => {
                     finished = true;
                     self.busy = false;
@@ -517,24 +631,38 @@ impl MoltApp {
                     // consume, punched bytes otherwise) — keeps the counter
                     // right even for formats we can't punch incrementally.
                     self.freed = reclaimed;
+                    let failed = self.files().any(|e| e.status == Status::Failed);
                     if archive_deleted {
-                        self.log =
-                            format!("Done — {} reclaimed, archive fully consumed.", human(self.freed));
+                        self.say(
+                            Tone::Ok,
+                            format!("Done — archive consumed, {} reclaimed.", human(self.freed)),
+                        );
                         self.archive_path = None;
+                        self.consumed = true;
                         self.pending_title = Some("Molt".to_string());
+                    } else if failed || self.tone == Tone::Err {
+                        // keep the error visible
                     } else if self.molt_mode {
                         if self.freed > 0 {
-                            self.log = format!("Done — {} reclaimed so far.", human(self.freed));
+                            self.say(
+                                Tone::Ok,
+                                format!(
+                                    "Done — {} reclaimed so far. The rest of the archive is kept.",
+                                    human(self.freed)
+                                ),
+                            );
+                        } else if self.tone != Tone::Warn {
+                            self.say(Tone::Ok, "Done.");
                         }
-                        // otherwise keep the last note/error visible
+                        // otherwise keep the last note visible
                     } else {
-                        self.log = "Done — archive untouched (Molt mode was off).".into();
+                        self.say(Tone::Ok, "Done — files extracted, archive left as it was.");
                     }
                 }
             }
         }
-        if finished {
-            self.rx = None;
+        if !finished {
+            self.rx = Some(rx);
         }
     }
 }
@@ -560,412 +688,890 @@ impl eframe::App for MoltApp {
         }
 
         // Drag-and-drop an archive onto the window
+        let modal = self.modal_open();
         let dropped: Vec<PathBuf> =
             ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         if let Some(p) = dropped.into_iter().next() {
-            if !self.busy {
+            if !self.busy && !modal {
                 self.open_archive(p);
             }
         }
 
-        // Minimal ("Molt here") mode is a bare centered dialog — no toolbar,
-        // no status bar, just the message and buttons in the central panel.
-        if !self.minimal {
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.heading("Molt");
-                ui.separator();
-                if ui.add_enabled(!self.busy, egui::Button::new("Open archive…")).clicked() {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("Archives", ARCHIVE_EXTS)
-                        .add_filter("All files", &["*"])
-                        .pick_file()
-                    {
-                        self.open_archive(p);
-                    }
-                }
-                if ui.add_enabled(!self.busy, egui::Button::new("Extract to…")).clicked() {
-                    if let Some(d) = rfd::FileDialog::new().pick_folder() {
-                        self.out_dir = Some(d);
-                    }
-                }
-                ui.checkbox(&mut self.molt_mode, "Molt mode").on_hover_text(
-                    "Free the archive's disk space as each file is extracted and verified. The archive is consumed — no undo.",
-                );
-
-                let can_go = self.archive_path.is_some() && self.out_dir.is_some() && !self.busy;
-                let label = if self.molt_mode { "Extract & Free" } else { "Extract" };
-                if ui
-                    .add_enabled(can_go, egui::Button::new(label))
-                    .on_disabled_hover_text("Open an archive and pick a destination first")
-                    .clicked()
-                {
-                    if self.molt_mode {
-                        self.confirm_pending = true;
-                    } else {
-                        self.start_extraction();
-                    }
-                }
-
-                #[cfg(windows)]
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.menu_button("⚙", |ui| {
-                        if ui.button("Add to Explorer right-click menu").clicked() {
-                            self.log = match shell::register() {
-                                Ok(()) => "Added to the right-click menu for archives.".into(),
-                                Err(e) => format!("Could not register: {e}"),
-                            };
-                            ui.close_menu();
-                        }
-                        if ui.button("Remove from right-click menu").clicked() {
-                            self.log = match shell::unregister() {
-                                Ok(()) => "Removed from the right-click menu.".into(),
-                                Err(e) => format!("Could not unregister: {e}"),
-                            };
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui.button("Check for updates…").clicked() {
-                            self.start_update_check();
-                            ui.close_menu();
-                        }
-                    });
-                });
-            });
-            ui.add_space(4.0);
-        });
-
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.add_space(2.0);
-            if self.busy && self.jobs_total > 0 {
-                ui.add(
-                    egui::ProgressBar::new(self.jobs_done as f32 / self.jobs_total as f32)
-                        .desired_height(6.0),
-                );
+        if self.minimal {
+            // "Molt here" is a bare dialog: no header, list or footer.
+            self.minimal_ui(ctx);
+        } else {
+            let open_shortcut =
+                egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
+            if !self.busy && !modal && ctx.input_mut(|i| i.consume_shortcut(&open_shortcut)) {
+                self.pick_archive();
             }
-            ui.horizontal(|ui| {
-                ui.label(&self.log);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.freed > 0 {
-                        ui.strong(format!("{} reclaimed", human(self.freed)));
-                    }
-                    if let Some(d) = &self.out_dir {
-                        ui.weak(format!("→ {}", d.display()));
-                    }
-                });
-            });
-            ui.add_space(2.0);
-        });
+            self.header_ui(ctx);
+            self.footer_ui(ctx);
+            self.contents_ui(ctx);
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if self.minimal {
-                let full_w = ui.available_width();
-                const BW: f32 = 88.0; // button width
-                const BH: f32 = 28.0; // button height
-
-                if self.password_request.is_some() {
-                    // The password window (below) covers this frame.
-                } else if self.confirm_pending {
-                    ui.add_space(28.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(
-                            egui::RichText::new("Molt will extract and consume this archive.")
-                                .strong(),
-                        );
-                        ui.add_space(2.0);
-                        ui.label("Are you sure?");
-                    });
-                    ui.add_space(20.0);
-                    ui.horizontal(|ui| {
-                        let gap = ui.spacing().item_spacing.x;
-                        ui.add_space(((full_w - (BW * 2.0 + gap)) * 0.5).max(0.0));
-                        if ui.add_sized([BW, BH], egui::Button::new("Confirm")).clicked() {
-                            self.confirm_pending = false;
-                            self.start_extraction();
-                        }
-                        if ui.add_sized([BW, BH], egui::Button::new("Cancel")).clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    });
-                } else if self.busy {
-                    ui.add_space(52.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(format!("Extracting… {}/{}", self.jobs_done, self.jobs_total));
-                    });
-                } else {
-                    // Done (consumed, kept after a failure, or never opened).
-                    ui.add_space(34.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(&self.log);
-                    });
-                    ui.add_space(18.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(((full_w - BW) * 0.5).max(0.0));
-                        if ui.add_sized([BW, BH], egui::Button::new("Close")).clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    });
-                }
-                return;
-            }
-
-            if self.entries.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    if self.archive_path.is_some() {
-                        ui.weak("This archive is empty.");
-                    } else {
-                        ui.weak("Drop an archive here — zip, 7z, rar, tar.gz, …");
-                    }
-                });
-                return;
-            }
-            ui.horizontal(|ui| {
-                if ui.small_button("Select all").clicked() {
-                    self.entries.iter_mut().for_each(|e| e.selected = true);
-                }
-                if ui.small_button("Select none").clicked() {
-                    self.entries.iter_mut().for_each(|e| e.selected = false);
-                }
-            });
-            ui.separator();
-
-            let busy = self.busy;
-            let mut drag_request: Option<usize> = None;
-            // Rows are drag sources, not text: no I-beam cursor anywhere
-            // in the table, and the whole row (not just the name) drags.
-            ui.style_mut().interaction.selectable_labels = false;
-            egui_extras::TableBuilder::new(ui)
-                .striped(true)
-                .sense(egui::Sense::click_and_drag())
-                .column(egui_extras::Column::exact(24.0))
-                .column(egui_extras::Column::remainder().clip(true))
-                .column(egui_extras::Column::auto().at_least(90.0))
-                .column(egui_extras::Column::auto().at_least(120.0))
-                .header(22.0, |mut header| {
-                    header.col(|_| {});
-                    header.col(|ui| {
-                        ui.strong("Name");
-                    });
-                    header.col(|ui| {
-                        ui.strong("Size");
-                    });
-                    header.col(|ui| {
-                        ui.strong("Status");
-                    });
-                })
-                .body(|mut body| {
-                    for (i, e) in
-                        self.entries.iter_mut().enumerate().filter(|(_, e)| !e.is_dir)
-                    {
-                        body.row(20.0, |mut row| {
-                            row.col(|ui| {
-                                ui.add_enabled(
-                                    !busy,
-                                    egui::Checkbox::without_text(&mut e.selected),
-                                );
-                            });
-                            row.col(|ui| {
-                                ui.label(&e.name);
-                            });
-                            row.col(|ui| {
-                                ui.label(human(e.size));
-                            });
-                            row.col(|ui| {
-                                match e.status {
-                                    Status::Pending => ui.weak("—"),
-                                    Status::Extracting => ui.label("extracting…"),
-                                    Status::Freed => ui.colored_label(
-                                        egui::Color32::from_rgb(120, 220, 120),
-                                        "✔ freed",
-                                    ),
-                                    Status::Extracted => ui.colored_label(
-                                        egui::Color32::from_rgb(120, 180, 220),
-                                        "✔ extracted",
-                                    ),
-                                    Status::Resumed => ui.colored_label(
-                                        egui::Color32::from_rgb(150, 190, 150),
-                                        "✔ out earlier",
-                                    ),
-                                    Status::Failed => ui.colored_label(
-                                        egui::Color32::from_rgb(230, 120, 120),
-                                        "✖ failed",
-                                    ),
-                                };
-                            });
-
-                            // Whole-row drag → copy the file out to Explorer.
-                            if cfg!(windows) && !busy {
-                                let resp = row
-                                    .response()
-                                    .on_hover_cursor(egui::CursorIcon::Grab)
-                                    .on_hover_text(
-                                        "Drag out of the window to copy this file into Explorer",
-                                    );
-                                if resp.drag_started() {
-                                    drag_request = Some(i);
-                                }
-                            }
-                        });
-                    }
-                });
-
-            #[cfg(windows)]
-            if let Some(i) = drag_request {
-                self.drag_out(i);
-            }
-            #[cfg(not(windows))]
-            let _ = drag_request;
-        });
-
-        // Password prompt for encrypted archives
-        if let Some(path) = self.password_request.clone() {
-            egui::Window::new("Password required")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(format!(
-                        "{} is encrypted.",
-                        path.file_name().map(|s| s.to_string_lossy()).unwrap_or_default()
-                    ));
-                    if self.password_wrong {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(230, 120, 120),
-                            "That password didn't work — try again.",
-                        );
-                    }
-                    let edit = ui.add(
-                        egui::TextEdit::singleline(&mut self.password_input)
-                            .password(true)
-                            .hint_text("Password"),
-                    );
-                    edit.request_focus();
-                    let submitted =
-                        edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Unlock").clicked() || submitted {
-                            self.password = Some(std::mem::take(&mut self.password_input));
-                            self.password_request = None;
-                            self.open_archive(path.clone());
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.password_request = None;
-                            self.password_input.clear();
-                            self.log = "Archive is encrypted — no password given.".into();
-                        }
-                    });
-                });
+        if self.modal_open() {
+            theme::dim_background(ctx);
         }
-
-        // Destructive-action confirmation (minimal mode renders this inline
-        // in the central panel instead — there's no file browser to overlay).
+        self.password_dialog(ctx);
         if self.confirm_pending && !self.minimal {
-            egui::Window::new("Consume archive?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(
-                        "Molt mode frees the archive's disk space as files are\nextracted and verified. The archive cannot be recovered.",
-                    );
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Consume it").clicked() {
-                            self.confirm_pending = false;
-                            self.start_extraction();
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.confirm_pending = false;
-                        }
-                    });
-                });
+            self.confirm_dialog(ctx);
         }
-
         #[cfg(windows)]
         self.update_dialog(ctx);
     }
 }
 
-#[cfg(windows)]
+/// Width of the left-hand labels in the footer ("Extract to", "Mode").
+const LABEL_W: f32 = 78.0;
+
+fn row_label(ui: &mut egui::Ui, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(LABEL_W, 26.0), Sense::hover());
+    ui.painter().text(
+        rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::proportional(14.0),
+        theme::TEXT_DIM,
+    );
+}
+
+/// A sunken, clickable box showing a path (truncated to fit).
+fn path_box(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
+    let size = Vec2::new(ui.available_width().max(60.0), 30.0);
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    let border = if enabled && resp.hovered() { theme::ACCENT } else { theme::BORDER };
+    ui.painter().rect(rect, 6.0, theme::SUNKEN, Stroke::new(1.0_f32, border));
+    let mut inner = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink2(Vec2::new(10.0, 0.0)))
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    inner.add(egui::Label::new(RichText::new(text).color(theme::TEXT)).truncate().selectable(false));
+    let resp = if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
+    resp.on_hover_text(text)
+}
+
+/// "photos/2024/IMG_1.jpg" → ("photos/2024/", "IMG_1.jpg")
+fn split_name(name: &str) -> (&str, &str) {
+    match name.rfind(['/', '\\']) {
+        Some(p) => name.split_at(p + 1),
+        None => ("", name),
+    }
+}
+
+fn status_cell(ui: &mut egui::Ui, status: Status, selected: bool, busy: bool) {
+    match status {
+        Status::Pending if !selected => {
+            ui.label(dim("—"));
+        }
+        Status::Pending => {
+            ui.label(dim(if busy { "Queued" } else { "Ready" }));
+        }
+        Status::Extracting => {
+            ui.add(egui::Spinner::new().size(13.0));
+            ui.label(RichText::new("Extracting…").color(theme::INFO));
+        }
+        Status::Freed => {
+            ui.label(RichText::new("✔ Extracted · freed").color(theme::OK))
+                .on_hover_text("Extracted and verified; its space in the archive was given back");
+        }
+        Status::Extracted => {
+            ui.label(RichText::new("✔ Extracted").color(theme::INFO));
+        }
+        Status::Resumed => {
+            ui.label(RichText::new("✔ Already extracted").color(theme::OK))
+                .on_hover_text("Extracted by an earlier, interrupted run");
+        }
+        Status::Failed => {
+            ui.label(RichText::new("✖ Failed").color(theme::ERR));
+        }
+    }
+}
+
+/// Open a folder in the system file manager.
+fn reveal(path: &Path) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
+/// Pin a right-aligned row of buttons to the bottom of the remaining space.
+fn bottom_buttons(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    ui.with_layout(Layout::bottom_up(Align::Max), |ui| {
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 32.0),
+            Layout::right_to_left(Align::Center),
+            add,
+        );
+    });
+}
+
 impl MoltApp {
-    /// The "Check for updates" modal. Renders whatever state the updater is
-    /// in and drives the Update-now / dismiss actions.
+    /// One line under the archive name: what it is and how big.
+    fn subtitle(&self) -> String {
+        if self.consumed {
+            return format!("Consumed — {} reclaimed", human(self.freed));
+        }
+        let files = self.files().count();
+        let total: u64 = self.files().map(|e| e.size).sum();
+        format!(
+            "{} archive · {} file{} · {} packed, {} unpacked",
+            self.kind.to_uppercase(),
+            files,
+            if files == 1 { "" } else { "s" },
+            human(self.archive_size),
+            human(total),
+        )
+    }
+
+    // ------------------------------------------------------------ header
+
+    fn header_ui(&mut self, ctx: &egui::Context) {
+        let logo = self.logo_texture(ctx);
+        egui::TopBottomPanel::top("header")
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(16.0, 12.0)),
+            )
+            .show(ctx, |ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(ui.available_width(), 38.0),
+                    Layout::right_to_left(Align::Center),
+                    |ui| {
+                        #[cfg(windows)]
+                        self.settings_menu(ui);
+                        if ui
+                            .add_enabled(!self.busy, theme::secondary("Open archive…"))
+                            .on_hover_text(
+                                "Choose an archive to open (Ctrl+O).\nYou can also drop one onto the window.",
+                            )
+                            .clicked()
+                        {
+                            self.pick_archive();
+                        }
+                        ui.add_space(8.0);
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                                logo.id(),
+                                [34.0, 34.0],
+                            )));
+                            ui.add_space(2.0);
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                let (title, sub) = if self.archive_name.is_empty() {
+                                    (
+                                        "Molt".to_string(),
+                                        "Extract archives without doubling your disk usage"
+                                            .to_string(),
+                                    )
+                                } else {
+                                    (self.archive_name.clone(), self.subtitle())
+                                };
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(title).font(theme::semibold(17.0)),
+                                    )
+                                    .truncate(),
+                                );
+                                ui.add(egui::Label::new(dim(sub).small()).truncate());
+                            });
+                        });
+                    },
+                );
+            });
+    }
+
+    #[cfg(windows)]
+    fn settings_menu(&mut self, ui: &mut egui::Ui) {
+        let busy = self.busy;
+        ui.menu_button("⚙  Settings", |ui| {
+            ui.set_min_width(260.0);
+            ui.label(dim("Explorer right-click menu").small());
+            if ui
+                .button("Add “Open with Molt” and “Molt here”")
+                .on_hover_text("Adds Molt to the right-click menu of archive files (just for you, no admin needed)")
+                .clicked()
+            {
+                match shell::register() {
+                    Ok(()) => self.say(Tone::Ok, "Added to the right-click menu for archives."),
+                    Err(e) => self.say(Tone::Err, format!("Couldn't add to the right-click menu: {e}")),
+                }
+                ui.close_menu();
+            }
+            if ui.button("Remove Molt from the right-click menu").clicked() {
+                match shell::unregister() {
+                    Ok(()) => self.say(Tone::Ok, "Removed from the right-click menu."),
+                    Err(e) => self.say(Tone::Err, format!("Couldn't remove from the right-click menu: {e}")),
+                }
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui
+                .add_enabled(!busy, egui::Button::new("Check for updates…"))
+                .on_disabled_hover_text("Wait for the extraction to finish")
+                .clicked()
+            {
+                self.start_update_check();
+                ui.close_menu();
+            }
+            ui.separator();
+            ui.label(dim(format!("Molt {}", molt::VERSION)).small());
+        });
+    }
+
+    // ------------------------------------------------------------ footer
+
+    fn footer_ui(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("footer")
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(16.0, 12.0)),
+            )
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
+                if !self.entries.is_empty() {
+                    self.destination_row(ui);
+                    self.mode_row(ui);
+                    ui.separator();
+                }
+                if self.busy && self.jobs_total > 0 {
+                    let color = if self.molt_mode { theme::MOLT } else { theme::ACCENT };
+                    ui.add(
+                        egui::ProgressBar::new(self.jobs_done as f32 / self.jobs_total as f32)
+                            .text(format!("{} of {} files", self.jobs_done, self.jobs_total))
+                            .fill(color)
+                            .desired_height(18.0),
+                    );
+                }
+                self.status_row(ui);
+            });
+    }
+
+    fn destination_row(&mut self, ui: &mut egui::Ui) {
+        let busy = self.busy;
+        let mut pick = false;
+        ui.horizontal(|ui| {
+            row_label(ui, "Extract to");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add_enabled(!busy, theme::secondary("Change…"))
+                    .on_hover_text("Pick a different destination folder")
+                    .clicked()
+                {
+                    pick = true;
+                }
+                if let Some(d) = self.out_dir.as_deref().filter(|d| d.is_dir()) {
+                    if ui
+                        .add(theme::secondary("Open folder"))
+                        .on_hover_text("Open the destination folder")
+                        .clicked()
+                    {
+                        reveal(d);
+                    }
+                }
+                let text = self
+                    .out_dir
+                    .as_ref()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|| "Choose a folder…".into());
+                if path_box(ui, &text, !busy).clicked() {
+                    pick = true;
+                }
+            });
+        });
+        if pick {
+            self.pick_destination();
+        }
+    }
+
+    fn mode_row(&mut self, ui: &mut egui::Ui) {
+        let busy = self.busy;
+        let consumed = self.consumed;
+        let (n, bytes) = self.to_extract();
+        let mut go = false;
+        ui.horizontal(|ui| {
+            row_label(ui, "Mode");
+            theme::segmented(
+                ui,
+                &mut self.molt_mode,
+                &[
+                    (
+                        false,
+                        "Keep archive",
+                        "Copy the files out and leave the archive exactly as it was.",
+                        theme::ACCENT,
+                    ),
+                    (
+                        true,
+                        "Consume archive",
+                        "Free the archive's disk space as each file is extracted and verified.\nOnce everything is out, the archive is deleted.",
+                        theme::MOLT,
+                    ),
+                ],
+                !busy && !consumed,
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let (label, color) = if self.molt_mode {
+                    ("Extract & consume", theme::MOLT)
+                } else {
+                    ("Extract", theme::ACCENT)
+                };
+                let blocked = if consumed {
+                    Some("This archive has been consumed — open another one")
+                } else if busy {
+                    Some("Extraction in progress")
+                } else if self.out_dir.is_none() {
+                    Some("Choose a destination folder first")
+                } else if n == 0 {
+                    Some("Tick at least one file to extract")
+                } else {
+                    None
+                };
+                let resp = ui.add_enabled(
+                    blocked.is_none(),
+                    theme::primary(label, color).min_size(Vec2::new(150.0, 32.0)),
+                );
+                let resp = match blocked {
+                    Some(why) => resp.on_disabled_hover_text(why),
+                    None => resp.on_hover_text(format!(
+                        "{n} file{}, {}",
+                        if n == 1 { "" } else { "s" },
+                        human(bytes)
+                    )),
+                };
+                if resp.clicked() {
+                    go = true;
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(LABEL_W + ui.spacing().item_spacing.x);
+            let text = if self.molt_mode {
+                "Space is freed as each file is verified, and the archive is deleted once everything is out. There's no undo."
+            } else {
+                "Files are copied out. The archive is left as it was."
+            };
+            ui.add(egui::Label::new(dim(text).small()).wrap());
+        });
+        if go {
+            if self.molt_mode {
+                self.confirm_pending = true;
+            } else {
+                self.start_extraction();
+            }
+        }
+    }
+
+    fn status_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if self.freed > 0 {
+                    ui.label(
+                        RichText::new(format!("{} reclaimed", human(self.freed)))
+                            .font(theme::semibold(14.0))
+                            .color(theme::OK),
+                    )
+                    .on_hover_text("Disk space given back so far");
+                }
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    if self.busy {
+                        ui.add(egui::Spinner::new().size(14.0));
+                    } else if !self.tone.icon().is_empty() {
+                        ui.label(RichText::new(self.tone.icon()).color(self.tone.color()));
+                    }
+                    ui.add(
+                        egui::Label::new(RichText::new(&self.log).color(self.tone.color()))
+                            .truncate(),
+                    );
+                });
+            });
+        });
+    }
+
+    // ---------------------------------------------------------- contents
+
+    fn contents_ui(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::symmetric(16.0, 12.0)),
+            )
+            .show(ctx, |ui| {
+                if self.entries.is_empty() {
+                    self.empty_state(ui);
+                } else {
+                    self.file_table(ui);
+                }
+            });
+    }
+
+    /// Nothing open: a big drop target with one obvious button.
+    fn empty_state(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.available_rect_before_wrap();
+        let dropping = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+        let (fill, stroke) = if dropping {
+            (Color32::from_rgb(0x1e, 0x27, 0x36), Stroke::new(2.0_f32, theme::ACCENT))
+        } else {
+            (Color32::from_rgb(0x1f, 0x20, 0x24), Stroke::new(1.0_f32, theme::BORDER))
+        };
+        ui.painter().rect(rect, 12.0, fill, stroke);
+
+        let mut open = false;
+        let mut inner = ui.new_child(
+            egui::UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Center)),
+        );
+        inner.add_space(((rect.height() - 200.0) / 2.0).max(12.0));
+        let empty_archive = self.archive_path.is_some();
+        inner.label(RichText::new("📦").size(48.0).color(theme::TEXT_DIM));
+        inner.add_space(4.0);
+        let title = if dropping {
+            "Drop to open"
+        } else if empty_archive {
+            "This archive is empty"
+        } else {
+            "Drop an archive here"
+        };
+        inner.label(RichText::new(title).font(theme::semibold(19.0)));
+        inner.label(dim(if empty_archive { "There's nothing inside to extract." } else { "or" }));
+        inner.add_space(6.0);
+        let label = if empty_archive { "Open another archive…" } else { "Open archive…" };
+        if inner
+            .add(theme::primary(label, theme::ACCENT).min_size(Vec2::new(180.0, 34.0)))
+            .on_hover_text("Ctrl+O")
+            .clicked()
+        {
+            open = true;
+        }
+        inner.add_space(12.0);
+        inner.label(dim("zip · 7z · rar · tar · gz · bz2 · xz · zst").small());
+
+        ui.allocate_rect(rect, Sense::hover());
+        if open {
+            self.pick_archive();
+        }
+    }
+
+    fn file_table(&mut self, ui: &mut egui::Ui) {
+        let busy = self.busy;
+        let rows: Vec<usize> =
+            self.entries.iter().enumerate().filter(|(_, e)| !e.is_dir).map(|(i, _)| i).collect();
+        let n_files = rows.len();
+        let (n_sel, sel_bytes) = self
+            .files()
+            .filter(|e| e.selected)
+            .fold((0usize, 0u64), |(n, b), e| (n + 1, b + e.size));
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Contents").font(theme::semibold(15.0)));
+            ui.label(dim(format!(
+                "{n_sel} of {n_files} file{} selected · {}",
+                if n_files == 1 { "" } else { "s" },
+                human(sel_bytes)
+            )));
+            #[cfg(windows)]
+            if !busy {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(dim("Tip: drag files into Explorer to copy them out").small());
+                });
+            }
+        });
+        ui.add_space(4.0);
+
+        let mut drag_request: Option<usize> = None;
+        let mut set_all: Option<bool> = None;
+        let entries = &mut self.entries;
+        egui::Frame::none()
+            .fill(theme::SURFACE)
+            .rounding(8.0)
+            .stroke(Stroke::new(1.0_f32, theme::BORDER))
+            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+            .show(ui, |ui| {
+                // Rows are drag sources, not text: no I-beam cursor anywhere
+                // in the table, and the whole row (not just the name) drags.
+                ui.style_mut().interaction.selectable_labels = false;
+                use egui_extras::{Column, TableBuilder};
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .sense(Sense::click_and_drag())
+                    .auto_shrink([false, false])
+                    .max_scroll_height(f32::INFINITY)
+                    .cell_layout(Layout::left_to_right(Align::Center))
+                    .column(Column::exact(28.0))
+                    .column(Column::remainder().clip(true))
+                    .column(Column::exact(96.0))
+                    .column(Column::exact(170.0))
+                    .header(26.0, |mut header| {
+                        header.col(|ui| {
+                            let mut all = n_files > 0 && n_sel == n_files;
+                            let mixed = n_sel > 0 && n_sel < n_files;
+                            if ui
+                                .add_enabled(
+                                    !busy,
+                                    egui::Checkbox::without_text(&mut all).indeterminate(mixed),
+                                )
+                                .on_hover_text("Select all / none")
+                                .changed()
+                            {
+                                set_all = Some(all);
+                            }
+                        });
+                        header.col(|ui| {
+                            ui.label(dim("Name"));
+                        });
+                        header.col(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.add_space(14.0);
+                                ui.label(dim("Size"));
+                            });
+                        });
+                        header.col(|ui| {
+                            ui.label(dim("Status"));
+                        });
+                    })
+                    .body(|body| {
+                        body.rows(26.0, rows.len(), |mut row| {
+                            let i = rows[row.index()];
+                            let e = &mut entries[i];
+                            let mut box_clicked = false;
+                            row.col(|ui| {
+                                box_clicked = ui
+                                    .add_enabled(!busy, egui::Checkbox::without_text(&mut e.selected))
+                                    .clicked();
+                            });
+                            row.col(|ui| {
+                                let (dir, file) = split_name(&e.name);
+                                let fg = if e.selected { theme::TEXT } else { theme::TEXT_DIM };
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                if !dir.is_empty() {
+                                    ui.label(RichText::new(dir).color(theme::TEXT_DIM));
+                                }
+                                ui.label(RichText::new(file).color(fg));
+                            });
+                            row.col(|ui| {
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.add_space(14.0);
+                                    ui.label(dim(human(e.size)));
+                                });
+                            });
+                            row.col(|ui| status_cell(ui, e.status, e.selected, busy));
+
+                            if !busy {
+                                let resp = row.response();
+                                // Click anywhere on the row toggles it.
+                                if resp.clicked() && !box_clicked {
+                                    e.selected = !e.selected;
+                                }
+                                // Whole-row drag → copy the file out to Explorer.
+                                if cfg!(windows) {
+                                    let resp = resp.on_hover_cursor(egui::CursorIcon::Grab);
+                                    if resp.drag_started() {
+                                        drag_request = Some(i);
+                                    }
+                                }
+                            }
+                        });
+                    });
+            });
+
+        if let Some(v) = set_all {
+            self.entries.iter_mut().for_each(|e| e.selected = v);
+        }
+        #[cfg(windows)]
+        if let Some(i) = drag_request {
+            self.drag_out(i);
+        }
+        #[cfg(not(windows))]
+        let _ = drag_request;
+    }
+
+    // ------------------------------------------------- "Molt here" dialog
+
+    fn minimal_ui(&mut self, ctx: &egui::Context) {
+        let logo = self.logo_texture(ctx);
+        let (n, bytes) = self.to_extract();
+        let mut start = false;
+        let mut close = false;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(theme::BG).inner_margin(egui::Margin::same(20.0)))
+            .show(ctx, |ui| {
+                if self.password_request.is_some() {
+                    return; // the password dialog covers this
+                }
+                let (title, color) = if self.confirm_pending {
+                    ("Consume this archive?", theme::TEXT)
+                } else if self.busy {
+                    ("Extracting…", theme::TEXT)
+                } else {
+                    match self.tone {
+                        Tone::Ok => ("Done", theme::OK),
+                        Tone::Err => ("Something went wrong", theme::ERR),
+                        Tone::Warn => ("Finished — see note", theme::WARN),
+                        Tone::Info => ("Molt", theme::TEXT),
+                    }
+                };
+                ui.horizontal(|ui| {
+                    ui.add(egui::Image::new(egui::load::SizedTexture::new(logo.id(), [36.0, 36.0])));
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.label(RichText::new(title).font(theme::semibold(17.0)).color(color));
+                        ui.add(egui::Label::new(dim(&self.archive_name)).truncate());
+                    });
+                });
+                ui.add_space(12.0);
+
+                if self.confirm_pending {
+                    let dest = self
+                        .out_dir
+                        .as_deref()
+                        .and_then(Path::file_name)
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    ui.label(format!(
+                        "{n} file{} ({}) will be extracted to the “{dest}” folder next to it.",
+                        if n == 1 { "" } else { "s" },
+                        human(bytes)
+                    ));
+                    ui.label(
+                        RichText::new("The archive is deleted as it empties — there's no undo.")
+                            .color(theme::WARN),
+                    );
+                    bottom_buttons(ui, |ui| {
+                        if ui.add(theme::secondary("Cancel")).clicked() {
+                            close = true;
+                        }
+                        if ui.add(theme::primary("Extract & consume", theme::MOLT)).clicked() {
+                            start = true;
+                        }
+                    });
+                } else if self.busy {
+                    ui.add(
+                        egui::ProgressBar::new(
+                            self.jobs_done as f32 / self.jobs_total.max(1) as f32,
+                        )
+                        .text(format!("{} of {} files", self.jobs_done, self.jobs_total))
+                        .fill(theme::MOLT)
+                        .desired_height(18.0),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(dim(format!("{} reclaimed so far", human(self.freed))));
+                } else {
+                    ui.add(egui::Label::new(RichText::new(&self.log).color(self.tone.color())).wrap());
+                    let folder = self.out_dir.clone().filter(|d| d.is_dir());
+                    bottom_buttons(ui, |ui| {
+                        if ui.add(theme::primary("Close", theme::ACCENT)).clicked() {
+                            close = true;
+                        }
+                        if let Some(d) = &folder {
+                            if ui.add(theme::secondary("Open folder")).clicked() {
+                                reveal(d);
+                                close = true;
+                            }
+                        }
+                    });
+                }
+            });
+        if self.confirm_pending && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            close = true;
+        }
+        if start {
+            self.confirm_pending = false;
+            self.start_extraction();
+        }
+        if close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    // ------------------------------------------------------------ dialogs
+
+    fn password_dialog(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.password_request.clone() else { return };
+        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut submit = false;
+        let mut cancel = false;
+        theme::dialog("password").show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.label(RichText::new("Password required").font(theme::semibold(17.0)));
+            ui.add_space(4.0);
+            ui.label(format!("“{name}” is encrypted. Enter its password to open it."));
+            if self.password_wrong {
+                ui.label(RichText::new("That password didn't work — try again.").color(theme::ERR));
+            }
+            ui.add_space(6.0);
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut self.password_input)
+                    .password(true)
+                    .hint_text("Password")
+                    .desired_width(f32::INFINITY),
+            );
+            edit.request_focus();
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                submit = true;
+            }
+            theme::button_row(ui, |ui| {
+                if ui.add(theme::secondary("Cancel")).clicked() {
+                    cancel = true;
+                }
+                if ui.add(theme::primary("Unlock", theme::ACCENT)).clicked() {
+                    submit = true;
+                }
+            });
+        });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if submit {
+            self.password = Some(std::mem::take(&mut self.password_input));
+            self.password_request = None;
+            self.open_archive(path);
+        } else if cancel {
+            self.password_request = None;
+            self.password_input.clear();
+            if self.minimal {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            self.archive_name.clear();
+            self.say(Tone::Warn, "That archive is encrypted — no password given.");
+        }
+    }
+
+    /// Last chance before a destructive run.
+    fn confirm_dialog(&mut self, ctx: &egui::Context) {
+        let (n, bytes) = self.to_extract();
+        let dest = self.out_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default();
+        let mut go = false;
+        let mut cancel = false;
+        theme::dialog("confirm").show(ctx, |ui| {
+            ui.set_width(390.0);
+            ui.label(RichText::new("Consume this archive?").font(theme::semibold(17.0)));
+            ui.add_space(6.0);
+            ui.label(format!(
+                "{n} file{} ({}) will be extracted to:",
+                if n == 1 { "" } else { "s" },
+                human(bytes)
+            ));
+            ui.add(egui::Label::new(dim(dest)).wrap());
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    "As each file is verified, its space is freed from the archive. Once everything is out, the archive is deleted.",
+                )
+                .wrap(),
+            );
+            ui.add_space(4.0);
+            ui.label(RichText::new("⚠  There's no undo — the archive can't be recovered.").color(theme::WARN));
+            theme::button_row(ui, |ui| {
+                if ui.add(theme::secondary("Cancel")).clicked() {
+                    cancel = true;
+                }
+                if ui.add(theme::primary("Extract & consume", theme::MOLT)).clicked() {
+                    go = true;
+                }
+            });
+        });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if go {
+            self.confirm_pending = false;
+            self.start_extraction();
+        } else if cancel {
+            self.confirm_pending = false;
+        }
+    }
+
+    /// The "Check for updates" dialog. Renders whatever state the updater
+    /// is in and drives the Update-now / dismiss actions.
+    #[cfg(windows)]
     fn update_dialog(&mut self, ctx: &egui::Context) {
         if matches!(self.update, UpdateUi::Hidden) {
             return;
         }
         let mut dismiss = false;
         let mut apply: Option<update::Update> = None;
-        egui::Window::new("Software update")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                match &self.update {
-                    UpdateUi::Hidden => {}
-                    UpdateUi::Checking => {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("Checking for updates…");
-                        });
-                    }
-                    UpdateUi::UpToDate(v) => {
-                        ui.label(format!("You're on the latest version ({v})."));
-                        ui.add_space(8.0);
-                        if ui.button("OK").clicked() {
+        theme::dialog("update").show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.label(RichText::new("Software update").font(theme::semibold(17.0)));
+            ui.add_space(6.0);
+            match &self.update {
+                UpdateUi::Hidden => {}
+                UpdateUi::Checking => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Checking for a newer version…");
+                    });
+                }
+                UpdateUi::UpToDate(v) => {
+                    ui.label(format!("You're on the latest version ({v})."));
+                    theme::button_row(ui, |ui| {
+                        if ui.add(theme::primary("OK", theme::ACCENT)).clicked() {
                             dismiss = true;
                         }
-                    }
-                    UpdateUi::Available(u) => {
-                        ui.label(
-                            egui::RichText::new(format!("Version {} is available.", u.version))
-                                .strong(),
-                        );
-                        ui.label(format!("You have {}.", update::current_version()));
-                        ui.add_space(6.0);
-                        ui.weak("Downloads the new build, verifies it, and restarts Molt.");
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("Update now").clicked() {
-                                apply = Some(u.clone());
-                            }
-                            if ui.button("Later").clicked() {
-                                dismiss = true;
-                            }
-                            if !u.notes_url.is_empty()
-                                && ui.button("Release notes").clicked()
-                            {
+                    });
+                }
+                UpdateUi::Available(u) => {
+                    ui.label(
+                        RichText::new(format!("Version {} is available", u.version))
+                            .font(theme::semibold(14.0))
+                            .color(theme::OK),
+                    );
+                    ui.label(dim(format!("You have {}.", update::current_version())));
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            dim("Molt downloads the new build, checks its SHA-256, swaps itself in place and restarts.")
+                                .small(),
+                        )
+                        .wrap(),
+                    );
+                    theme::button_row(ui, |ui| {
+                        if ui.add(theme::secondary("Later")).clicked() {
+                            dismiss = true;
+                        }
+                        if ui.add(theme::primary("Update now", theme::ACCENT)).clicked() {
+                            apply = Some(u.clone());
+                        }
+                        if !u.notes_url.is_empty() {
+                            ui.add_space(6.0);
+                            if ui.link("Release notes").clicked() {
                                 let _ = open_url(&u.notes_url);
                             }
-                        });
-                    }
-                    UpdateUi::Downloading { got, total } => {
-                        let frac = total.map(|t| *got as f32 / t.max(1) as f32);
-                        ui.label("Downloading update…");
-                        ui.add_space(4.0);
-                        let bar = match frac {
-                            Some(f) => egui::ProgressBar::new(f).show_percentage(),
-                            None => egui::ProgressBar::new(0.0)
-                                .animate(true)
-                                .text(human(*got)),
-                        };
-                        ui.add(bar.desired_width(240.0));
-                    }
-                    UpdateUi::Failed(e) => {
-                        ui.colored_label(egui::Color32::from_rgb(230, 120, 120), "Update failed");
-                        ui.label(e.as_str());
-                        ui.add_space(8.0);
-                        if ui.button("OK").clicked() {
+                        }
+                    });
+                }
+                UpdateUi::Downloading { got, total } => {
+                    let frac = total.map(|t| *got as f32 / t.max(1) as f32);
+                    ui.label("Downloading update…");
+                    ui.add_space(4.0);
+                    let bar = match frac {
+                        Some(f) => egui::ProgressBar::new(f).show_percentage(),
+                        None => egui::ProgressBar::new(0.0).animate(true).text(human(*got)),
+                    };
+                    ui.add(bar.desired_width(f32::INFINITY));
+                }
+                UpdateUi::Failed(e) => {
+                    ui.label(RichText::new("✖  Update failed").color(theme::ERR));
+                    ui.add(egui::Label::new(e.as_str()).wrap());
+                    theme::button_row(ui, |ui| {
+                        if ui.add(theme::primary("OK", theme::ACCENT)).clicked() {
                             dismiss = true;
                         }
-                    }
+                    });
                 }
-                ui.add_space(2.0);
-            });
+            }
+        });
+        let can_dismiss =
+            matches!(self.update, UpdateUi::UpToDate(_) | UpdateUi::Available(_) | UpdateUi::Failed(_));
+        if can_dismiss && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            dismiss = true;
+        }
         if dismiss {
             self.update = UpdateUi::Hidden;
         }
@@ -1033,12 +1639,13 @@ fn main() -> Result<(), eframe::Error> {
     let viewport = if molt_here {
         // A small fixed-size confirm dialog, not the full file browser.
         egui::ViewportBuilder::default()
-            .with_inner_size([380.0, 160.0])
+            .with_inner_size([440.0, 220.0])
             .with_resizable(false)
+            .with_maximize_button(false)
     } else {
         egui::ViewportBuilder::default()
-            .with_inner_size([680.0, 440.0])
-            .with_min_inner_size([560.0, 360.0])
+            .with_inner_size([800.0, 600.0])
+            .with_min_inner_size([620.0, 420.0])
     };
     let options = eframe::NativeOptions {
         viewport: viewport.with_drag_and_drop(true).with_icon(load_icon()),
@@ -1050,7 +1657,7 @@ fn main() -> Result<(), eframe::Error> {
         "Molt",
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            theme::install(&cc.egui_ctx);
             let mut app = MoltApp { minimal: molt_here, ..MoltApp::default() };
             // Support `molt-gui archive.zip` / "Open with…" / "Molt here"
             // (open_archive arms the consume-confirmation itself in

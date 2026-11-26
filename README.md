@@ -165,16 +165,16 @@ Two format-specific caveats:
 
 Molt ships as **one portable executable** — no installer, no runtime, nothing for the user to build. Double-click it (or right-click a zip → Open with Molt) and you get a 7-Zip-style window:
 
-- Open an archive via the button, drag-and-drop onto the window, or "Open with…"
-- Contents listed with sizes; tick what you want, or Select all
-- **Molt mode** toggle: on = the archive is consumed as files come out; off = classic extraction
-- **Extract & Free** with a clear "no undo" confirmation
-- Live status per file (`extracting… / ✔ freed / ✔ extracted / ✖ failed`) and a running "X reclaimed" counter
+- Open an archive with **Open archive…** (Ctrl+O), by dropping it onto the window, or "Open with…"
+- Contents listed with sizes; tick what you want (the header checkbox selects all or none, clicking a row ticks it)
+- Pick where it goes under **Extract to**, and a mode: **Keep archive** (classic extraction) or **Consume archive** (the archive is freed as files come out)
+- The main button says what will happen: **Extract**, or an orange **Extract & consume** with a clear "no undo" confirmation
+- Live status per file (`Extracting… / ✔ Extracted · freed / ✔ Extracted / ✖ Failed`) and a running "X reclaimed" counter
 - When the whole archive has been extracted and verified, the hollow shell is deleted
 - **Drag a row into Explorer** to copy that file out without consuming anything
-- **⚙ → Add to Explorer right-click menu** installs "Open with Molt" / "Molt here" for archives (equivalent to `molt-gui --register`; per-user, no admin needed)
+- **Settings → Add "Open with Molt" and "Molt here"** puts Molt in the right-click menu for archives (equivalent to `molt-gui --register`; per-user, no admin needed)
 - **"Molt here"** skips the file browser entirely: a small warning dialog, then it just extracts and consumes the archive. No listing, no toggles — the whole point is that it's already decided.
-- **⚙ → Check for updates** — Molt updates itself. It checks the latest GitHub release, and if there's a newer version, downloads it, **verifies the download's SHA-256 against the hash in the release notes** before touching anything, replaces the running executable in place, and restarts. Because it swaps the exe at the same path, your right-click integration keeps working — no re-register. The check is a single request to GitHub's public API and only happens when you click it; nothing phones home on its own. (Windows only.)
+- **Settings → Check for updates** — Molt updates itself. It checks the latest GitHub release, and if there's a newer version, downloads it, **verifies the download's SHA-256 against the hash in the release notes** before touching anything, replaces the running executable in place, and restarts. Because it swaps the exe at the same path, your right-click integration keeps working — no re-register. The check is a single request to GitHub's public API and only happens when you click it; nothing phones home on its own. (Windows only.)
 
 Extraction runs on a background thread; each file is CRC-verified before its bytes are punched, same as the CLI.
 
