@@ -183,14 +183,17 @@ Build it with `cargo build --release --features gui` → `molt-gui` (~6 MB). The
 ## Usage
 
 ```
-molt <archive> [OPTIONS]
+molt <archive>... [OPTIONS]
 
-  -o, --output <DIR>   Destination directory (default: archive name)
+  -o, --output <DIR>   Destination (one archive: extract here; several: a
+                       subfolder per archive). Default: next to each archive.
   -k, --keep           Normal extraction; archive untouched
   -n, --dry-run        Show the space profile without extracting
   -y, --yes            Skip the confirmation prompt (never blocks on input)
   -p, --password <PW>  Password for encrypted zip/7z/rar (prompted if omitted)
 ```
+
+Give it several archives (`molt a.zip b.7z c.rar`) and it molts them one after another with a single confirmation, then prints a summary. A password that works is tried on the next archive too.
 
 ## Building
 
